@@ -21,9 +21,14 @@ that repeats a failure recorded in the lessons.
 From the policy:
 
 - `human_only_paths`: never edit these, even to fix a tier 1.
-- `design_triggers`: changes that need a design decision from the human.
+- `design_triggers`: changes that need a design decision from the human. A trigger
+  applies only when the diff clearly matches it. Adding a helper or export that changes
+  nothing existing is not a breaking public API change.
 - `never_run`: tests or commands you must not run. Also never run anything that
   opens a real database or reaches a production service.
+
+CI runs the project's tests, so don't try to run them here. That isn't a gap to
+report: judge the code by reading it, and let CI confirm it.
 
 ## 2. Review
 
@@ -109,8 +114,10 @@ Use `gh pr edit <PR> --add-label <label>`. Pick the first that applies:
 1. `human/sensitive`: the diff touches a `human_only_paths` file, or a tier 1 fix
    would need one.
 2. `human/design`: the diff hits a `design_triggers` item.
-3. `agent/could-not-verify`: something that mattered could not be checked. Never
-   report a check that failed to run as "nothing found".
-4. `agent/ready`: reviewed, with no unresolved tier 1.
+3. `agent/could-not-verify`: you couldn't complete the review itself, such as an
+   unreadable diff or policy. Tests left to CI don't count. Never report a check that
+   failed to run as "nothing found".
+4. `agent/ready`: reviewed, with no unresolved tier 1. This includes a recommendation
+   of "Ship after CI passes on the fix commit."
 
 Never use `gh pr merge`, and never push to any other branch.
