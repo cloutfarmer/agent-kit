@@ -1,0 +1,58 @@
+name: agent-tripwire
+
+# Managed by agent-kit. Flags claude[bot] commits that reached the default or
+# base branch without a pull request. It detects this but can't prevent it.
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  tripwire:
+    if: github.event.deleted == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      COMMITS: ${{ toJSON(github.event.commits) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check for bot commits outside a PR
+        shell: bash
+        run: |
+          base="$(sed -n 's/^base_branch:[[:space:]]*//p' .agent/policy.yml | tr -d "\"' ")"
+          if [[ -z "$base" ]]; then
+            echo "COULD NOT VERIFY base_branch is missing from .agent/policy.yml"
+            exit 2
+          fi
+          if [[ "$BRANCH" != "$base" && "$BRANCH" != "$DEFAULT_BRANCH" ]]; then
+            echo "PASS $BRANCH is not a protected branch"
+            exit 0
+          fi
+          bot_shas="$(jq -r '.[] | select(.author.name == "claude[bot]" or .committer.name == "claude[bot]") | .id' <<<"$COMMITS")"
+          flagged=""
+          for sha in $bot_shas; do
+            count="$(gh api "repos/$GH_REPO/commits/$sha/pulls" --jq 'length')"
+            if [[ "$count" == "0" ]]; then
+              flagged="$flagged $sha"
+            fi
+          done
+          if [[ -z "$flagged" ]]; then
+            echo "PASS no bot commits outside a PR"
+            exit 0
+          fi
+          gh issue create --title "agent-tripwire: bot commit on $BRANCH outside a PR" \
+            --body "These commits reached \`$BRANCH\` without a pull request:$flagged"
+          echo "FAIL bot commits outside a PR:$flagged"
+          exit 1

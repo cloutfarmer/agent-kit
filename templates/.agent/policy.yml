@@ -1,0 +1,9 @@
+# Owned by this project. The kit reads this file and never overwrites it.
+modules: [{{MODULES}}]
+base_branch: {{BASE_BRANCH}}
+ci_job: {{CI_JOB}}
+scan_command: {{SCAN_COMMAND}}
+human_only_paths: [.env*, .github/workflows/**, .agent/policy.yml]
+design_triggers: [new dependency, schema change, public API change, auth change]
+never_run: []
+allowed_extra_docs: []

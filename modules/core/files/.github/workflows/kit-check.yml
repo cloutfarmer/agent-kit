@@ -1,0 +1,48 @@
+name: kit-check
+
+# Managed by agent-kit. Compares this repo with the kit version in .agent/kit.lock.
+# Any step that can't run fails the job, so an unknown result never looks like a pass.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kit-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read kit version
+        id: kit
+        shell: bash
+        run: |
+          version="$(node -p 'JSON.parse(require("fs").readFileSync(".agent/kit.lock","utf8")).version')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "COULD NOT VERIFY .agent/kit.lock has an invalid version"
+            exit 2
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch that kit version
+        id: source
+        shell: bash
+        env:
+          VERSION: ${{ steps.kit.outputs.version }}
+          KIT_URL: https://github.com/cloutfarmer/agent-kit.git
+        run: |
+          git clone --quiet --depth 1 --branch "v$VERSION" "$KIT_URL" "$RUNNER_TEMP/agent-kit"
+          latest="$(git ls-remote --tags --refs "$KIT_URL" 'v*' | sed 's#.*refs/tags/v##' | sort -V | tail -n 1)"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Check against the kit
+        shell: bash
+        env:
+          LATEST: ${{ steps.source.outputs.latest }}
+        run: node "$RUNNER_TEMP/agent-kit/bin/kit.mjs" check --repo . --latest-version "$LATEST"

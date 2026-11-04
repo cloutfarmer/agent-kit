@@ -1,0 +1,88 @@
+name: agent-brief
+
+# Managed by agent-kit. Reviews each non-draft PR and leaves one brief and one
+# label. It never merges. Add the claude-review label to run it again.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+# Events this workflow ignores get their own group, so the labels and fix
+# commits made by a running review can't cancel that review.
+concurrency:
+  group: agent-brief-${{ github.event.pull_request.number }}-${{ ((github.event.action == 'labeled' && github.event.label.name != 'claude-review') || github.actor == 'claude[bot]') && github.run_id || 'review' }}
+  cancel-in-progress: true
+
+jobs:
+  brief:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'claude[bot]' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Reset brief labels
+        shell: bash
+        run: |
+          gh label create agent/ready --force --color 0E8A16 --description "Agent found nothing blocking"
+          gh label create human/design --force --color 5319E7 --description "Needs a design decision"
+          gh label create human/sensitive --force --color B60205 --description "Touches a human-only path"
+          gh label create agent/could-not-verify --force --color D93F0B --description "Review did not complete"
+          gh label create claude-review --force --color BFD4F2 --description "Run the agent review again"
+          gh label create tier-2 --force --color FBCA04 --description "Minor bug filed by review"
+          gh label create tier-3 --force --color C5DEF5 --description "Unreachable or non-bug filed by review"
+          gh pr edit "$PR" --remove-label agent/ready --remove-label human/design \
+            --remove-label human/sensitive --remove-label agent/could-not-verify --remove-label claude-review
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            BASE BRANCH: ${{ github.event.pull_request.base.ref }}
+            REVIEWED SHA: ${{ github.event.pull_request.head.sha }}
+
+            Run the pr-triage skill on this pull request.
+          claude_args: |
+            --model opus
+            --max-turns 60
+            --allowedTools "Skill,Read,Glob,Grep,Edit,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin HEAD),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr edit:*),Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh issue comment:*)"
+
+      # Only an exact, current brief with one label counts. Everything else,
+      # including an agent failure, is reported as could-not-verify.
+      - name: Verify the brief
+        if: always()
+        shell: bash
+        run: |
+          view="$(gh pr view "$PR" --json labels,comments)"
+          labels="$(jq -r '[.labels[].name | select(. == "agent/ready" or . == "human/design" or . == "human/sensitive" or . == "agent/could-not-verify")] | length' <<<"$view")"
+          brief="$(jq --arg sha "Reviewed SHA: $HEAD_SHA" '[.comments[].body | select(contains("<!-- agent-brief -->") and contains($sha))] | length' <<<"$view")"
+          if [[ "$labels" == "1" && "$brief" -ge 1 ]]; then
+            echo "PASS brief recorded for $HEAD_SHA"
+            exit 0
+          fi
+          gh pr edit "$PR" --remove-label agent/ready --remove-label human/design \
+            --remove-label human/sensitive --add-label agent/could-not-verify
+          echo "COULD NOT VERIFY labels=$labels matching_briefs=$brief"
+          exit 1
