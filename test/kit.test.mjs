@@ -149,6 +149,15 @@ test("a missing AGENTS.md section fails", () => {
   assert.match(result.out, /missing section "## Safety rules"/);
 });
 
+test("a missing Session budget section fails", () => {
+  const repo = adopted();
+  const path = join(repo, "AGENTS.md");
+  writeFileSync(path, readFileSync(path, "utf8").replace("## Session budget", "## Budget"));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /missing section "## Session budget"/);
+});
+
 test("CLAUDE.md with extra rules fails", () => {
   const repo = adopted();
   writeFileSync(join(repo, "CLAUDE.md"), "@AGENTS.md\nAnother rule.\n");

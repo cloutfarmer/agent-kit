@@ -43,3 +43,12 @@ evidence, not current instructions.
   instead of repeating them.
 - Run the smallest safe relevant tests first.
 - A check that can't run reports "could not verify", never "nothing found".
+
+## Session budget
+
+- One task per session. When a task is done, end with "Task done — run /clear
+  before the next task."
+- Context is capped at 300k tokens by the machine setting
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000`; keep it set.
+- Turn off plugins and skills this repo doesn't use (`enabledPlugins` in
+  `.claude/settings.json`).
