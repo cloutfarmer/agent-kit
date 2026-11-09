@@ -25,6 +25,7 @@ const REQUIRED_DOCS = [
 ];
 const AGENTS_SECTIONS = [
   "Repository", "Start here", "Safety rules", "Engineering invariants", "Working standard",
+  "Session budget",
 ];
 const DOCS_ROOT_ALLOWED = new Set([
   "README.md", "STATUS.md", "TESTING.md", "SECURITY.md", "ROADMAP.md",
