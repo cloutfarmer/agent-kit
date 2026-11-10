@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- `agent-brief` skips with a warning when `CLAUDE_CODE_OAUTH_TOKEN` is not set, instead
+  of failing and adding `agent/could-not-verify` to every PR. A real agent failure is
+  still reported as could-not-verify.
+
 ## 1.1.0
 
 - `AGENTS.md` now requires a `## Session budget` section: one task per session ending

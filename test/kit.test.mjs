@@ -158,6 +158,21 @@ test("a missing Session budget section fails", () => {
   assert.match(result.out, /missing section "## Session budget"/);
 });
 
+test("agent-brief skips every review step when the token is missing", () => {
+  const text = readFileSync(join(KIT_ROOT, "modules/triage/files/.github/workflows/agent-brief.yml"), "utf8");
+  const steps = text.split(/^      - /m).slice(1);
+  const tokenStep = steps.findIndex((step) => step.includes("id: token"));
+  assert.ok(tokenStep >= 0, "the token check step is missing");
+  assert.match(steps[tokenStep], /HAS_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN != '' \}\}/);
+  const later = steps.slice(tokenStep + 1);
+  assert.ok(later.length >= 3);
+  for (const step of later) {
+    assert.match(step, /^\s+if: .*steps\.token\.outputs\.present == 'true'/m, step.split("\n")[0]);
+  }
+  const verify = later.find((step) => step.startsWith("name: Verify the brief"));
+  assert.match(verify, /if: always\(\) && steps\.token\.outputs\.present == 'true'/);
+});
+
 test("CLAUDE.md with extra rules fails", () => {
   const repo = adopted();
   writeFileSync(join(repo, "CLAUDE.md"), "@AGENTS.md\nAnother rule.\n");
