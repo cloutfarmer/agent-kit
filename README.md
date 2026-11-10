@@ -47,8 +47,9 @@ and run `sync` in the repo on a review branch.
 ## Setup for the `triage` module
 
 Add `CLAUDE_CODE_OAUTH_TOKEN` to the repo's Actions secrets and install the Claude
-GitHub App. Repos on GitHub Free can't enforce any of this on merge, so treat a failed
-check as your signal not to merge.
+GitHub App. Without the secret, `agent-brief` skips with a warning instead of failing,
+and no review runs. Repos on GitHub Free can't enforce any of this on merge, so treat a
+failed check as your signal not to merge.
 
 See `PRINCIPLES.md` for how the kit applies its source principles.
 
