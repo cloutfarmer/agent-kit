@@ -27,7 +27,7 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 
 | Module | Adds |
 |---|---|
-| `core` (required) | `kit-check` workflow and repository scan |
+| `core` (required) | `kit-check` workflow, repository scan, and the `freshness` session-start hook |
 | `review` | `ponytail-review`, run on request |
 | `triage` (needs `review`) | `pr-triage`, plus the `agent-brief` and `agent-tripwire` workflows |
 
@@ -36,7 +36,7 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 | Group | Examples | Rule |
 |---|---|---|
 | Managed | Files under `modules/*/files/` | Must match the kit exactly |
-| Required structure | Required docs, `AGENTS.md` sections, `CLAUDE.md` | Must exist in the right shape |
+| Required structure | Required docs, `AGENTS.md` sections, `CLAUDE.md`, the freshness hook in `.claude/settings.json` | Must exist in the right shape |
 | Project-owned | `.agent/policy.yml`, `.agent/lessons.md`, doc content, the repo's CI | Never overwritten |
 
 `.agent/policy.yml` holds each repo's differences, and `.agent/kit.lock` records its kit

@@ -41,6 +41,9 @@ evidence, not current instructions.
 - Label facts as validated, unvalidated, historical, or inferred.
 - Update the canonical document in the same change as behavior; link to facts
   instead of repeating them.
+- Before planning, run `git fetch origin` and read code from `origin/<base>`
+  (`git show origin/<base>:<path>` or a fresh worktree), not the local checkout.
+  Merge `origin/<base>` into a work branch before its PR.
 - Run the smallest safe relevant tests first.
 - A check that can't run reports "could not verify", never "nothing found".
 

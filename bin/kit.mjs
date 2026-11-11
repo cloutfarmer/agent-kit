@@ -37,9 +37,34 @@ const SCALAR_KEYS = ["base_branch", "ci_job", "scan_command"];
 const TEMPLATE_FILES = [
   "AGENTS.md", "CLAUDE.md", "README.md", "ARCHITECTURE.md",
   "docs/README.md", "docs/STATUS.md", "docs/TESTING.md", ".agent/lessons.md",
+  ".claude/settings.json",
 ];
+const SETTINGS_PATH = ".claude/settings.json";
+const FRESHNESS_SCRIPT = ".agent/freshness.mjs";
 
 class CouldNotVerify extends Error {}
+
+// Returns why .claude/settings.json doesn't run the freshness hook at session start, or null.
+function settingsProblem(repo) {
+  const path = join(repo, SETTINGS_PATH);
+  if (!existsSync(path)) return `${SETTINGS_PATH}: required file is missing`;
+  let settings;
+  try {
+    settings = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return `${SETTINGS_PATH}: not valid JSON`;
+  }
+  const groups = settings?.hooks?.SessionStart;
+  const registered = Array.isArray(groups) && groups.some((group) =>
+    Array.isArray(group?.hooks) && group.hooks.some((hook) =>
+      typeof hook?.command === "string" && hook.command.includes(FRESHNESS_SCRIPT)));
+  return registered ? null : `${SETTINGS_PATH}: no SessionStart hook runs ${FRESHNESS_SCRIPT}`;
+}
+
+function settingsNote(problem) {
+  const snippet = readFileSync(join(KIT_ROOT, "templates", SETTINGS_PATH), "utf8").trim();
+  return `NOTE ${problem}; left unchanged. Add this hook:\n${snippet}`;
+}
 
 function sha256(data) {
   return createHash("sha256").update(data).digest("hex");
@@ -209,6 +234,8 @@ export function runCheck(repo, { latestVersion } = {}) {
       }
     }
   }
+  const settings = settingsProblem(repo);
+  if (settings) failures.push(settings);
 
   const extras = new Set((policy.allowed_extra_docs ?? []).map((path) => path.replace(/\/$/, "")));
   if (existsSync(join(repo, "docs"))) {
@@ -394,6 +421,10 @@ function adopt(repo, options) {
       projectFiles.set(ciPath, renderCi(repo, policy.ci_job, policy.scan_command, policy.base_branch));
     }
   }
+  if (!projectFiles.has(SETTINGS_PATH)) {
+    const problem = settingsProblem(repo);
+    if (problem) console.log(settingsNote(problem));
+  }
 
   for (const path of creates) console.log(`CREATE managed ${path}`);
   for (const path of projectFiles.keys()) console.log(`CREATE project ${path}`);
@@ -431,6 +462,8 @@ function sync(repo, options) {
     .filter((path) => !managed.has(path) && existsSync(join(repo, path)));
   for (const path of updates) console.log(`UPDATE ${path}`);
   for (const path of removals) console.log(`REMOVE ${path}`);
+  const settings = settingsProblem(repo);
+  if (settings) console.log(settingsNote(settings));
   console.log(`Kit ${lock.version} -> ${VERSION}`);
 
   if (!options.write) {
