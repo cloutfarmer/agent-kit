@@ -370,3 +370,96 @@ test("the scan reports could-not-verify outside a git repo", () => {
   assert.equal(result.status, 2);
   assert.match(result.stdout, /COULD NOT VERIFY/);
 });
+
+test("a fresh adopt registers the freshness hook, and removing it fails", () => {
+  const repo = adopted();
+  const path = join(repo, ".claude/settings.json");
+  assert.match(readFileSync(path, "utf8"), /\.agent\/freshness\.mjs/);
+  assert.equal(kit(repo, "check").status, 0);
+  writeFileSync(path, JSON.stringify({ enabledPlugins: {} }));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /FAIL \.claude\/settings\.json: no SessionStart hook runs \.agent\/freshness\.mjs/);
+  writeFileSync(path, "{not json");
+  assert.match(kit(repo, "check").out, /FAIL \.claude\/settings\.json: not valid JSON/);
+  rmSync(path);
+  assert.match(kit(repo, "check").out, /FAIL \.claude\/settings\.json: required file is missing/);
+});
+
+test("adopt leaves an existing settings file alone and prints the hook", () => {
+  const repo = tempDir();
+  git(repo, "init", "-q", "-b", "main");
+  mkdirSync(join(repo, ".claude"));
+  const original = `${JSON.stringify({ enabledPlugins: { x: false } })}\n`;
+  writeFileSync(join(repo, ".claude/settings.json"), original);
+  const result = kit(repo, "adopt", "--write");
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.out, /NOTE \.claude\/settings\.json: no SessionStart hook runs/);
+  assert.match(result.out, /"SessionStart"/);
+  assert.equal(readFileSync(join(repo, ".claude/settings.json"), "utf8"), original);
+  assert.equal(kit(repo, "check").status, 1);
+});
+
+const COMMIT = ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m"];
+
+function freshness(repo) {
+  const script = join(repo, ".agent/freshness.mjs");
+  const result = spawnSync("node", [script], {
+    encoding: "utf8", cwd: tempDir(), env: { ...process.env, CLAUDE_PROJECT_DIR: repo },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.hookSpecificOutput.hookEventName, "SessionStart");
+  assert.equal(output.systemMessage, output.hookSpecificOutput.additionalContext);
+  return output.systemMessage;
+}
+
+// A clone of a bare origin with the kit adopted and pushed, plus a second clone to push from.
+function clonedRepo() {
+  const root = tempDir();
+  const origin = join(root, "origin.git");
+  git(root, "init", "-q", "--bare", "-b", "main", origin);
+  const seed = join(root, "seed");
+  git(root, "clone", "-q", origin, seed);
+  assert.equal(kit(seed, "adopt", "--write").status, 0);
+  git(seed, "add", "-A");
+  git(seed, ...COMMIT, "init");
+  git(seed, "push", "-q", "origin", "main");
+  const repo = join(root, "work");
+  git(root, "clone", "-q", origin, repo);
+  return { repo, seed };
+}
+
+test("freshness reports a checkout that is behind, without changing it", () => {
+  const { repo, seed } = clonedRepo();
+  assert.match(freshness(repo), /has everything on origin\/main/);
+
+  git(seed, ...COMMIT, "new work");
+  git(seed, "push", "-q", "origin", "main");
+  const head = git(repo, "rev-parse", "HEAD");
+  const message = freshness(repo);
+  assert.match(message, /local main is 1 commit behind origin\/main/);
+  assert.match(message, /Read code from origin\/main/);
+  assert.equal(git(repo, "rev-parse", "HEAD"), head);
+  assert.equal(git(repo, "status", "--porcelain"), "");
+
+  git(repo, "checkout", "-q", "-b", "work/x", head.trim());
+  assert.match(freshness(repo), /work\/x is missing 1 commit from origin\/main/);
+});
+
+test("freshness reads the base branch from policy", () => {
+  const { repo } = clonedRepo();
+  setPolicy(repo, "base_branch", "trunk");
+  assert.match(freshness(repo), /could not verify \(origin\/trunk does not exist\)/);
+});
+
+test("freshness without a remote is could-not-verify", () => {
+  const repo = adopted("core");
+  assert.match(freshness(repo), /Freshness: could not verify \(no origin remote\)/);
+});
+
+test("freshness with an unreachable origin is could-not-verify", () => {
+  const repo = adopted("core");
+  git(repo, "remote", "add", "origin", join(tempDir(), "missing.git"));
+  assert.match(freshness(repo), /could not verify \(git fetch origin failed/);
+});

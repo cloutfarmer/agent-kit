@@ -13,7 +13,7 @@ this kit keeps its core ideas and leaves out what exists to manage a community.
 | A failed check says "could not verify" | `kit check` exit code 2, and the `agent/could-not-verify` label. A module that isn't set up yet, such as `agent-brief` without its secret, is skipped with a warning, not failed |
 | Public actions depend on real success | The brief is verified by a separate step after the agent runs |
 | Lessons compound | `.agent/lessons.md`, read on every review, one rule per real failure |
-| Work is isolated | Separate worktrees and branches |
+| Work is isolated | Separate worktrees and branches. Agents read code from `origin/<base>`, and a session-start hook warns when the checkout is behind |
 
 Left out on purpose: Discord and community agents, first-timer gates, contributor
 dossiers, and a persistent fleet of sessions.
