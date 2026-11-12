@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0
+
+- New optional `delegate` module: a managed `.claude/agents/worker.md`. The main
+  agent plans, sends each brief to a worker, and reviews the result. Workers run
+  in their own worktree, can't spawn agents, commit locally and never push.
+- With `delegate` on, `check` requires a `## Delegation` section in `AGENTS.md`, and
+  `CLAUDE_CODE_SUBAGENT_MODEL` plus `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` under `env`
+  in `.claude/settings.json`, so every subagent runs on the model named there.
+  `adopt` adds both to files it creates. `adopt` and `sync` print the snippets when
+  an existing file lacks them.
+- Repos that don't turn `delegate` on only need a `sync`. A repo with its own
+  `.claude/agents/worker.md` must rename it or turn the module on.
+
 ## 1.2.0
 
 - New managed `.agent/freshness.mjs` in `core`: a SessionStart hook that runs
