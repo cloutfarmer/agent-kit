@@ -41,6 +41,9 @@ const TEMPLATE_FILES = [
 ];
 const SETTINGS_PATH = ".claude/settings.json";
 const FRESHNESS_SCRIPT = ".agent/freshness.mjs";
+const DELEGATE_SECTION = "Delegation";
+const SUBAGENT_MODEL = "CLAUDE_CODE_SUBAGENT_MODEL";
+const SUBAGENT_FORCE = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
 
 class CouldNotVerify extends Error {}
 
@@ -64,6 +67,57 @@ function settingsProblem(repo) {
 function settingsNote(problem) {
   const snippet = readFileSync(join(KIT_ROOT, "templates", SETTINGS_PATH), "utf8").trim();
   return `NOTE ${problem}; left unchanged. Add this hook:\n${snippet}`;
+}
+
+function delegateSnippet(name) {
+  return readFileSync(join(KIT_ROOT, "modules/delegate/snippets", name), "utf8").trim();
+}
+
+function hasSection(text, section) {
+  return new RegExp(`^## ${section}\\s*$`, "m").test(text);
+}
+
+// Returns what the delegate module still needs in AGENTS.md and .claude/settings.json.
+// A missing or unreadable file is reported by the general checks, not here.
+function delegateProblems(repo) {
+  const problems = [];
+  const agentsPath = join(repo, "AGENTS.md");
+  if (existsSync(agentsPath) && !hasSection(readFileSync(agentsPath, "utf8"), DELEGATE_SECTION)) {
+    problems.push({ path: "AGENTS.md", text: `AGENTS.md: module delegate needs section "## ${DELEGATE_SECTION}"` });
+  }
+  let settings = null;
+  try {
+    settings = JSON.parse(readFileSync(join(repo, SETTINGS_PATH), "utf8"));
+  } catch {
+    return problems;
+  }
+  const model = settings?.env?.[SUBAGENT_MODEL];
+  if (typeof model !== "string" || !model.trim()) {
+    problems.push({ path: SETTINGS_PATH, text: `${SETTINGS_PATH}: module delegate needs env.${SUBAGENT_MODEL}` });
+  }
+  if (settings?.env?.[SUBAGENT_FORCE] !== "1") {
+    problems.push({ path: SETTINGS_PATH, text: `${SETTINGS_PATH}: module delegate needs env.${SUBAGENT_FORCE} set to "1"` });
+  }
+  return problems;
+}
+
+// Prints what to add by hand to project-owned files the kit won't edit.
+function printDelegateNotes(problems) {
+  const paths = new Set(problems.map((problem) => problem.path));
+  for (const problem of problems) console.log(`NOTE ${problem.text}; left unchanged.`);
+  if (paths.has("AGENTS.md")) console.log(`Add this section to AGENTS.md:\n${delegateSnippet("AGENTS.md")}`);
+  if (paths.has(SETTINGS_PATH)) console.log(`Add these keys to ${SETTINGS_PATH}:\n${delegateSnippet("settings.json")}`);
+}
+
+// Adds the delegate module's parts to a project file the kit is creating.
+function withDelegate(path, text) {
+  if (path === "AGENTS.md") return `${text.trimEnd()}\n\n${delegateSnippet("AGENTS.md")}\n`;
+  if (path === SETTINGS_PATH) {
+    const settings = JSON.parse(text);
+    settings.env = { ...settings.env, ...JSON.parse(delegateSnippet("settings.json")).env };
+    return `${JSON.stringify(settings, null, 2)}\n`;
+  }
+  return text;
 }
 
 function sha256(data) {
@@ -229,13 +283,14 @@ export function runCheck(repo, { latestVersion } = {}) {
   if (existsSync(join(repo, "AGENTS.md"))) {
     const agents = readFileSync(join(repo, "AGENTS.md"), "utf8");
     for (const section of AGENTS_SECTIONS) {
-      if (!new RegExp(`^## ${section}\\s*$`, "m").test(agents)) {
-        failures.push(`AGENTS.md: missing section "## ${section}"`);
-      }
+      if (!hasSection(agents, section)) failures.push(`AGENTS.md: missing section "## ${section}"`);
     }
   }
   const settings = settingsProblem(repo);
   if (settings) failures.push(settings);
+  if (policy.modules.includes("delegate")) {
+    failures.push(...delegateProblems(repo).map((problem) => problem.text));
+  }
 
   const extras = new Set((policy.allowed_extra_docs ?? []).map((path) => path.replace(/\/$/, "")));
   if (existsSync(join(repo, "docs"))) {
@@ -398,6 +453,7 @@ function adopt(repo, options) {
   const project = resolve(repo).split(sep).pop();
 
   const managed = managedFiles(policy.modules);
+  const delegate = policy.modules.includes("delegate");
   const creates = [];
   const conflicts = [];
   for (const [path, source] of managed) {
@@ -408,7 +464,8 @@ function adopt(repo, options) {
   if (!policyExists) projectFiles.set(POLICY_PATH, policyText);
   for (const path of TEMPLATE_FILES) {
     if (!existsSync(join(repo, path))) {
-      projectFiles.set(path, renderTemplate(readFileSync(join(KIT_ROOT, "templates", path), "utf8"), project));
+      const text = renderTemplate(readFileSync(join(KIT_ROOT, "templates", path), "utf8"), project);
+      projectFiles.set(path, delegate ? withDelegate(path, text) : text);
     }
   }
   const ciPresent = workflowFiles(repo, managed)
@@ -425,6 +482,7 @@ function adopt(repo, options) {
     const problem = settingsProblem(repo);
     if (problem) console.log(settingsNote(problem));
   }
+  if (delegate) printDelegateNotes(delegateProblems(repo).filter((problem) => !projectFiles.has(problem.path)));
 
   for (const path of creates) console.log(`CREATE managed ${path}`);
   for (const path of projectFiles.keys()) console.log(`CREATE project ${path}`);
@@ -464,6 +522,7 @@ function sync(repo, options) {
   for (const path of removals) console.log(`REMOVE ${path}`);
   const settings = settingsProblem(repo);
   if (settings) console.log(settingsNote(settings));
+  if (policy.modules.includes("delegate")) printDelegateNotes(delegateProblems(repo));
   console.log(`Kit ${lock.version} -> ${VERSION}`);
 
   if (!options.write) {

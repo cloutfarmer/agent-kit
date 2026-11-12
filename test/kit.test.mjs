@@ -463,3 +463,116 @@ test("freshness with an unreachable origin is could-not-verify", () => {
   git(repo, "remote", "add", "origin", join(tempDir(), "missing.git"));
   assert.match(freshness(repo), /could not verify \(git fetch origin failed/);
 });
+
+const WORKER = ".claude/agents/worker.md";
+
+function readJson(path) {
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+test("adopt with delegate installs the worker, the section and the forced model", () => {
+  const repo = adopted("core,delegate");
+  assert.equal(existsSync(join(repo, WORKER)), true);
+  assert.match(readFileSync(join(repo, "AGENTS.md"), "utf8"), /^## Delegation$/m);
+  const settings = readJson(join(repo, ".claude/settings.json"));
+  assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, "sonnet");
+  assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, "1");
+  assert.match(JSON.stringify(settings.hooks), /freshness\.mjs/);
+  const result = kit(repo, "check");
+  assert.equal(result.status, 0, result.out);
+});
+
+test("without delegate, nothing of it is installed or required", () => {
+  const repo = adopted();
+  assert.equal(existsSync(join(repo, WORKER)), false);
+  assert.doesNotMatch(readFileSync(join(repo, "AGENTS.md"), "utf8"), /## Delegation/);
+  assert.equal(readJson(join(repo, ".claude/settings.json")).env, undefined);
+  assert.equal(kit(repo, "check").status, 0);
+});
+
+test("with delegate on, a missing Delegation section fails", () => {
+  const repo = adopted("core,delegate");
+  const path = join(repo, "AGENTS.md");
+  writeFileSync(path, readFileSync(path, "utf8").replace("## Delegation", "## Helpers"));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /FAIL AGENTS\.md: module delegate needs section "## Delegation"/);
+});
+
+test("with delegate on, the subagent model must be set and forced", () => {
+  const repo = adopted("core,delegate");
+  const path = join(repo, ".claude/settings.json");
+  const original = readJson(path);
+
+  const unforced = structuredClone(original);
+  unforced.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = "0";
+  writeFileSync(path, JSON.stringify(unforced));
+  const first = kit(repo, "check");
+  assert.equal(first.status, 1, first.out);
+  assert.match(first.out, /needs env\.CLAUDE_CODE_SUBAGENT_MODEL_FORCE set to "1"/);
+
+  const unset = structuredClone(original);
+  unset.env.CLAUDE_CODE_SUBAGENT_MODEL = " ";
+  writeFileSync(path, JSON.stringify(unset));
+  assert.match(kit(repo, "check").out, /FAIL \.claude\/settings\.json: module delegate needs env\.CLAUDE_CODE_SUBAGENT_MODEL\n/);
+
+  const { env: _env, ...noEnv } = original;
+  writeFileSync(path, JSON.stringify(noEnv));
+  const last = kit(repo, "check");
+  assert.equal(last.status, 1, last.out);
+  assert.match(last.out, /needs env\.CLAUDE_CODE_SUBAGENT_MODEL\n/);
+  assert.match(last.out, /needs env\.CLAUDE_CODE_SUBAGENT_MODEL_FORCE/);
+});
+
+test("editing the managed worker fails", () => {
+  const repo = adopted("core,delegate");
+  appendFileSync(join(repo, WORKER), "\nmodel: opus\n");
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /FAIL \.claude\/agents\/worker\.md: differs from kit/);
+});
+
+test("turning delegate on in an adopted repo: sync installs the worker and prints the rest", () => {
+  const repo = adopted("core");
+  git(repo, "add", "-A");
+  git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init");
+  git(repo, "checkout", "-q", "-b", "kit-sync");
+  setPolicy(repo, "modules", "[core, delegate]");
+  assert.equal(kit(repo, "check").status, 1);
+
+  const agentsBefore = readFileSync(join(repo, "AGENTS.md"), "utf8");
+  const settingsBefore = readFileSync(join(repo, ".claude/settings.json"), "utf8");
+  const synced = kit(repo, "sync", "--write");
+  assert.equal(synced.status, 0, synced.out);
+  assert.match(synced.out, /UPDATE \.claude\/agents\/worker\.md/);
+  assert.match(synced.out, /Add this section to AGENTS\.md:\n## Delegation/);
+  assert.match(synced.out, /Add these keys to \.claude\/settings\.json:/);
+  assert.equal(readFileSync(join(repo, "AGENTS.md"), "utf8"), agentsBefore);
+  assert.equal(readFileSync(join(repo, ".claude/settings.json"), "utf8"), settingsBefore);
+  assert.equal(kit(repo, "check").status, 1);
+
+  const snippets = join(KIT_ROOT, "modules/delegate/snippets");
+  appendFileSync(join(repo, "AGENTS.md"), `\n${readFileSync(join(snippets, "AGENTS.md"), "utf8")}`);
+  const settings = JSON.parse(settingsBefore);
+  settings.env = readJson(join(snippets, "settings.json")).env;
+  writeFileSync(join(repo, ".claude/settings.json"), JSON.stringify(settings, null, 2));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 0, result.out);
+});
+
+test("a project-owned worker.md fails while delegate is off", () => {
+  const repo = adopted("core");
+  mkdirSync(join(repo, ".claude/agents"), { recursive: true });
+  writeFileSync(join(repo, WORKER), "mine\n");
+  assert.match(kit(repo, "check").out, /worker\.md: belongs to module delegate, which is off/);
+});
+
+test("the worker is isolated, can't spawn agents, and leaves the model to settings", () => {
+  const text = readFileSync(join(KIT_ROOT, "modules/delegate/files", WORKER), "utf8");
+  const frontmatter = text.split("---")[1];
+  assert.match(frontmatter, /^name: worker$/m);
+  assert.match(frontmatter, /^isolation: worktree$/m);
+  assert.match(frontmatter, /^disallowedTools: Agent$/m);
+  assert.doesNotMatch(frontmatter, /^model:/m);
+  assert.match(text, /Never push/);
+});

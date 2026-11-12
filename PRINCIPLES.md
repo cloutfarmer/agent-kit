@@ -17,3 +17,8 @@ this kit keeps its core ideas and leaves out what exists to manage a community.
 
 Left out on purpose: Discord and community agents, first-timer gates, contributor
 dossiers, and a persistent fleet of sessions.
+
+Added beyond the source: the optional `delegate` module. The main agent plans and
+reviews on the strongest model, and `worker` agents do the edits on the cheaper model
+forced in `.claude/settings.json`. A worker lasts for one brief, so this is not a
+persistent fleet.
