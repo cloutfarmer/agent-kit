@@ -41,13 +41,21 @@ const TEMPLATE_FILES = [
 ];
 const SETTINGS_PATH = ".claude/settings.json";
 const FRESHNESS_SCRIPT = ".agent/freshness.mjs";
+const GUARD_SCRIPT = ".agent/guard.mjs";
 const DELEGATE_SECTION = "Delegation";
 const SUBAGENT_MODEL = "CLAUDE_CODE_SUBAGENT_MODEL";
 const SUBAGENT_FORCE = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
 
 class CouldNotVerify extends Error {}
 
-// Returns why .claude/settings.json doesn't run the freshness hook at session start, or null.
+function hasHook(settings, event, script) {
+  const groups = settings?.hooks?.[event];
+  return Array.isArray(groups) && groups.some((group) =>
+    Array.isArray(group?.hooks) && group.hooks.some((hook) =>
+      typeof hook?.command === "string" && hook.command.includes(script)));
+}
+
+// Returns why .claude/settings.json doesn't run the kit's hooks, or null.
 function settingsProblem(repo) {
   const path = join(repo, SETTINGS_PATH);
   if (!existsSync(path)) return `${SETTINGS_PATH}: required file is missing`;
@@ -57,16 +65,18 @@ function settingsProblem(repo) {
   } catch {
     return `${SETTINGS_PATH}: not valid JSON`;
   }
-  const groups = settings?.hooks?.SessionStart;
-  const registered = Array.isArray(groups) && groups.some((group) =>
-    Array.isArray(group?.hooks) && group.hooks.some((hook) =>
-      typeof hook?.command === "string" && hook.command.includes(FRESHNESS_SCRIPT)));
-  return registered ? null : `${SETTINGS_PATH}: no SessionStart hook runs ${FRESHNESS_SCRIPT}`;
+  if (!hasHook(settings, "SessionStart", FRESHNESS_SCRIPT)) {
+    return `${SETTINGS_PATH}: no SessionStart hook runs ${FRESHNESS_SCRIPT}`;
+  }
+  if (!hasHook(settings, "PreToolUse", GUARD_SCRIPT)) {
+    return `${SETTINGS_PATH}: no PreToolUse hook runs ${GUARD_SCRIPT}`;
+  }
+  return null;
 }
 
 function settingsNote(problem) {
   const snippet = readFileSync(join(KIT_ROOT, "templates", SETTINGS_PATH), "utf8").trim();
-  return `NOTE ${problem}; left unchanged. Add this hook:\n${snippet}`;
+  return `NOTE ${problem}; left unchanged. Add these hooks:\n${snippet}`;
 }
 
 function delegateSnippet(name) {
