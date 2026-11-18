@@ -5,10 +5,11 @@ the work, a person merges it, and a check keeps each repo matching the kit.
 
 ## Commands
 
-Run these from a local copy of the kit. `adopt` and `sync` only preview changes until
-you add `--write`.
+Run these from a local copy of the kit. `init`, `adopt` and `sync` only preview changes
+until you add `--write`.
 
 ```bash
+node bin/kit.mjs init  --repo ../my-project
 node bin/kit.mjs adopt --repo ../my-project --modules core,review,triage
 node bin/kit.mjs check --repo ../my-project
 node bin/kit.mjs sync  --repo ../my-project
@@ -20,14 +21,72 @@ node bin/kit.mjs sync  --repo ../my-project
 | 1 | Fail: the repo differs from the kit |
 | 2 | Could not verify: the check itself couldn't finish |
 
+Without a profile, `adopt` installs `core`, `review` and `triage`. With one, it defaults to
+`core` for `sandbox`, `core,review` for `personal`, and all three for `public` and
+`product`. `--modules` overrides the default.
+
 Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 `--replace-managed` to overwrite managed files that differ from the kit.
+
+## Project profiles
+
+A profile says what a repo is for, so the kit asks only for the process that purpose
+needs. Exposure (who can see or reach it) sets the security floor. Stakes (what breaks,
+and for whom) set the amount of process. Each profile includes everything in the ones
+above it.
+
+| Profile | For | Adds |
+|---|---|---|
+| `sandbox` | Learning and throwaway work | `README.md`, a short `AGENTS.md`. CI and `kit-check` are optional |
+| `personal` | Something deployed, or real personal data, paid services or production credentials | `docs/STATUS.md`, `docs/TESTING.md`, `docs/README.md`, CI with tests and the secret scan, the freshness hook |
+| `public` | A public repo or a live public site | `ARCHITECTURE.md`, `docs/operations/deploy.md`, `kit-check`, and a branch protection checklist |
+| `product` | Other people's data, accounts or money | `docs/SECURITY.md`, `docs/PRIVACY.md`, `docs/operations/rollback.md`, and a checklist for sandboxing, separate production credentials, dependency checks and a secret-history scan |
+
+Every profile keeps `CLAUDE.md`, `AGENTS.md` with its `Safety rules` and `Skill vetting`
+sections, `.agent/policy.yml`, and the `guard` and `skill-gate` hooks. A managed file a
+profile doesn't need is not installed or required. If a repo adds one anyway, such as
+`kit-check` in a sandbox, `check` holds it to the kit like any other managed file.
+
+A repo with no `profile` in its policy keeps the full requirements, so repos adopted
+before 1.7.0 stay valid. An unknown profile is "could not verify".
+
+### `kit init`
+
+`init` asks seven questions and recommends a profile. Without a terminal, such as in a
+script or an agent session, pass every answer as a flag:
+
+```bash
+node bin/kit.mjs init --repo ../my-project \
+  --goal learning|personal-tool|showcase|product \
+  --users only-me|invited|anyone \
+  --public yes|no --deployed yes|no \
+  --data none|personal|others \
+  --services none|paid|credentials|payments \
+  --recovery easy|moderate|hard
+```
+
+`--data personal` means your own personal or private data; `others` means anyone else's.
+The riskiest answer wins: other people's data, payments or a product goal give `product`;
+a public repo, a live site anyone can use, or a showcase give `public`; anything deployed,
+real personal data, paid services, production credentials, invited users or a hard
+recovery give `personal`; otherwise `sandbox`. The reason is saved as `profile_reason`.
+
+To choose a lighter profile than recommended, add `--profile NAME --reason "why"`. A
+stricter one needs only `--profile`. `init` refuses a repo that already has a policy.
+
+`init --reassess` asks again for an adopted repo and shows the new profile, the files it
+would create and the files it no longer requires. With `--write` it changes only the
+`profile` and `profile_reason` lines in `.agent/policy.yml` and creates missing files. It
+never deletes files and never edits `AGENTS.md`; it prints any section you need to add.
+
+`check` prints the `public` and `product` checklist items as "not verified by kit check",
+because it can't read GitHub settings or your machine.
 
 ## Modules
 
 | Module | Adds |
 |---|---|
-| `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, the `skill-gate` prompt hook, and the `guard` policy hook |
+| `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, the `skill-gate` prompt hook, and the `guard` policy hook. A profile can leave out the first three |
 | `review` | `ponytail-review`, run on request |
 | `triage` (needs `review`) | `pr-triage`, plus the `agent-brief` and `agent-tripwire` workflows |
 | `delegate` (optional, off by default) | The `worker` agent: the main agent plans and reviews, workers on a cheaper model do the edits |
@@ -37,8 +96,8 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 | Group | Examples | Rule |
 |---|---|---|
 | Managed | Files under `modules/*/files/` | Must match the kit exactly |
-| Required structure | Required docs, `AGENTS.md` sections (including `Skill vetting`), `CLAUDE.md`, the freshness, skill-gate and guard hooks in `.claude/settings.json`, and the `delegate` section and settings when that module is on | Must exist in the right shape |
-| Project-owned | `.agent/policy.yml`, `.agent/lessons.md`, doc content, the repo's CI | Never overwritten |
+| Required structure | The docs and `AGENTS.md` sections the profile requires (always `Safety rules` and `Skill vetting`), `CLAUDE.md`, the freshness, skill-gate and guard hooks in `.claude/settings.json`, and the `delegate` section and settings when that module is on | Must exist in the right shape |
+| Project-owned | `.agent/policy.yml`, `.agent/lessons.md`, doc content, the repo's CI | Never overwritten. `init --reassess --write` changes only the two profile lines |
 
 `.agent/policy.yml` holds each repo's differences, and `.agent/kit.lock` records its kit
 version and file hashes. Skills the kit doesn't provide are project-owned, and `check`

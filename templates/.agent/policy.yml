@@ -1,4 +1,4 @@
-# Owned by this project. The kit reads this file and never overwrites it.
+# Owned by this project. The kit never overwrites it; only kit init --reassess --write changes the profile lines.
 modules: [{{MODULES}}]
 base_branch: {{BASE_BRANCH}}
 ci_job: {{CI_JOB}}

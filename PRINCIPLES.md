@@ -26,3 +26,9 @@ persistent fleet.
 Also added: skill vetting in `core`. Third-party skills, plugins and MCP servers are
 scanned with SkillSpector before an agent adds them. A missing scanner or partial
 scan is "could not verify", not a pass.
+
+Also added: project profiles. The source article describes one large public project, where
+every safeguard is worth its cost. Across many small repos, a learning sandbox and a product
+with other people's data need different amounts of process, so each repo declares its
+purpose and the kit applies only what that purpose justifies. The safety floor (guard,
+skill vetting, secret rules) is the same for all of them.

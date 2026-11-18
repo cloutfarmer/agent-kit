@@ -5,6 +5,10 @@
 | `../ARCHITECTURE.md` | Durable design and invariants | Low |
 | `STATUS.md` | Latest verified state, blockers and next gates | High |
 | `TESTING.md` | Safe and destructive test procedures | Medium |
+| `operations/deploy.md` | How a change reaches users, and how to check it | Medium |
+| `SECURITY.md` | Secrets, access and how to report a problem | Medium |
+| `PRIVACY.md` | What personal data is held, where, and for how long | Medium |
+| `operations/rollback.md` | How to undo a bad release or data change | Medium |
 
 Add these when they have real content: `SECURITY.md`, `ROADMAP.md`, `plans/`,
 `operations/`, `decisions/` (`ADR-NNNN-<slug>.md`), and `history/` (dated, never edited).
