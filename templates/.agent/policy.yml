@@ -9,3 +9,9 @@ never_run: []
 allowed_extra_docs: []
 # Optional. Workers run this in their worktree before editing, for example npm ci.
 # setup_command: npm ci
+# Optional. When agent-brief reviews a PR: manual (never), label (only when claude-review
+# is added) or ready (when opened, reopened or marked ready, and on claude-review).
+# Pushing commits never starts a review. The default depends on the profile.
+# review_trigger: label
+# Optional. Word budget for AGENTS.md. kit check warns above it. The default depends on the profile.
+# agents_md_words: 600

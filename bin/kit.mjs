@@ -42,7 +42,9 @@ const REQUIRED_HOOKS = [
   { event: "PreToolUse", script: ".agent/guard.mjs" },
 ];
 // Settings a policy may leave out. A policy written before they existed stays valid.
-const OPTIONAL_SCALAR_KEYS = ["profile", "profile_reason", "setup_command"];
+const OPTIONAL_SCALAR_KEYS = ["profile", "profile_reason", "setup_command", "review_trigger", "agents_md_words"];
+// When the agent-brief workflow starts a review. It never starts one because commits were pushed.
+export const REVIEW_TRIGGERS = ["manual", "label", "ready"];
 
 // Each profile adds to the one before it. Exposure sets the security floor, stakes set
 // the amount of process. A repo with no profile keeps the full requirements above.
@@ -51,6 +53,8 @@ const SCAN = ".agent/repository-scan.mjs";
 const FRESHNESS = ".agent/freshness.mjs";
 const PROFILE_STEPS = {
   sandbox: {
+    reviewTrigger: "manual",
+    agentsMdWords: 300,
     docs: ["AGENTS.md", "CLAUDE.md", "README.md"],
     sections: ["Repository", "Safety rules", "Skill vetting"],
     ci: false,
@@ -60,6 +64,8 @@ const PROFILE_STEPS = {
     checklist: [],
   },
   personal: {
+    reviewTrigger: "label",
+    agentsMdWords: 600,
     docs: ["docs/README.md", "docs/STATUS.md", "docs/TESTING.md"],
     sections: ["Start here", "Working standard", "Session budget"],
     ci: true,
@@ -68,6 +74,8 @@ const PROFILE_STEPS = {
     checklist: [],
   },
   public: {
+    reviewTrigger: "ready",
+    agentsMdWords: 800,
     docs: ["ARCHITECTURE.md", "docs/operations/deploy.md"],
     sections: ["Engineering invariants"],
     ci: true,
@@ -81,6 +89,8 @@ const PROFILE_STEPS = {
     ],
   },
   product: {
+    reviewTrigger: "ready",
+    agentsMdWords: 1000,
     docs: ["docs/SECURITY.md", "docs/PRIVACY.md", "docs/operations/rollback.md"],
     sections: [],
     ci: true,
@@ -102,7 +112,7 @@ export function requirements(profile) {
   if (!profile) {
     return {
       docs: REQUIRED_DOCS, sections: AGENTS_SECTIONS, ci: true, optional: new Set(),
-      modules: ["core", "review", "triage"], checklist: [],
+      modules: ["core", "review", "triage"], checklist: [], reviewTrigger: "ready", agentsMdWords: null,
     };
   }
   const steps = PROFILES.slice(0, PROFILES.indexOf(profile) + 1).map((name) => PROFILE_STEPS[name]);
@@ -114,7 +124,26 @@ export function requirements(profile) {
     optional: new Set(steps.at(-1).optional),
     modules: steps.at(-1).modules,
     checklist: steps.flatMap((step) => step.checklist),
+    reviewTrigger: steps.at(-1).reviewTrigger,
+    agentsMdWords: steps.at(-1).agentsMdWords,
   };
+}
+
+// The review trigger and AGENTS.md word budget that apply, and whether the policy set them.
+export function costSettings(policy) {
+  const needs = requirements(policy.profile);
+  return {
+    trigger: policy.review_trigger ?? needs.reviewTrigger,
+    triggerSet: "review_trigger" in policy,
+    defaultTrigger: needs.reviewTrigger,
+    budget: "agents_md_words" in policy ? Number(policy.agents_md_words) : needs.agentsMdWords,
+    budgetSet: "agents_md_words" in policy,
+    defaultBudget: needs.agentsMdWords,
+  };
+}
+
+export function countWords(text) {
+  return text.split(/\s+/).filter(Boolean).length;
 }
 
 const DELEGATE_SECTION = "Delegation";
@@ -353,6 +382,12 @@ function validatePolicy(policy) {
   if ("profile" in policy && !PROFILES.includes(policy.profile)) {
     throw new CouldNotVerify(`${POLICY_PATH} has an unknown profile: "${policy.profile}" (use ${PROFILES.join(", ")})`);
   }
+  if ("review_trigger" in policy && !REVIEW_TRIGGERS.includes(policy.review_trigger)) {
+    throw new CouldNotVerify(`${POLICY_PATH} has an invalid review_trigger: "${policy.review_trigger}" (use ${REVIEW_TRIGGERS.join(", ")})`);
+  }
+  if ("agents_md_words" in policy && !/^[1-9]\d{0,5}$/.test(policy.agents_md_words)) {
+    throw new CouldNotVerify(`${POLICY_PATH} setting agents_md_words must be a whole number of words, such as 600`);
+  }
   for (const module of policy.modules) {
     if (!MODULE_NAMES.includes(module)) throw new CouldNotVerify(`${POLICY_PATH} has an unknown module: ${module}`);
     for (const needed of MODULE_DEPENDS[module] ?? []) {
@@ -450,6 +485,14 @@ export function runCheck(repo, { latestVersion } = {}) {
     const agents = readFileSync(join(repo, "AGENTS.md"), "utf8");
     for (const section of needs.sections) {
       if (!hasSection(agents, section)) failures.push(`AGENTS.md: missing section "## ${section}"`);
+    }
+    // Agents load AGENTS.md at the start of every session, so its length is paid on every task.
+    const { budget, budgetSet } = costSettings(policy);
+    const words = countWords(agents);
+    if (budget && words > budget) {
+      const from = budgetSet ? "agents_md_words" : `the ${policy.profile} profile`;
+      warnings.push(`AGENTS.md: ${words} words, over the budget of ${budget} from ${from}. `
+        + "Every agent session loads it; move detail into docs/ and link to it");
     }
   }
   failures.push(...settingsProblems(repo, requiredHooks(expected)));
@@ -624,6 +667,23 @@ function writeRepoFile(repo, path, data) {
 
 function differs(repo, path, source) {
   return sha256(readFileSync(join(repo, path))) !== sha256(readFileSync(source));
+}
+
+// Shows when agent-brief reviews and the AGENTS.md word budget, so their cost is visible.
+function printCostSettings(policy) {
+  const cost = costSettings(policy);
+  const name = policy.profile ?? "no profile";
+  const trigger = cost.triggerSet
+    ? `${cost.trigger} (set in ${POLICY_PATH}; the ${name} default is ${cost.defaultTrigger})`
+    : `${cost.trigger} (default for ${name}; set review_trigger in ${POLICY_PATH} to change it)`;
+  console.log(`TRIGGER agent-brief review_trigger: ${trigger}. Used only when the triage module is on.`);
+  const fallback = cost.defaultBudget ? `${cost.defaultBudget} words` : "none";
+  const budget = cost.budgetSet
+    ? `${cost.budget} words (set in ${POLICY_PATH}; the ${name} default is ${fallback})`
+    : cost.budget
+      ? `${cost.budget} words (default for ${name}; set agents_md_words in ${POLICY_PATH} to change it)`
+      : `none (no profile; set agents_md_words in ${POLICY_PATH} to add one)`;
+  console.log(`BUDGET AGENTS.md: ${budget}. kit check warns above it.`);
 }
 
 function printChecklist(needs) {
@@ -834,11 +894,13 @@ async function init(repo, options) {
       ciJob: options["ci-job"] ?? "ci",
       scanCommand: options["scan-command"] ?? DEFAULT_SCAN,
     });
+    printCostSettings({ profile: choice.profile });
     return adopt(repo, options, withProfile(text, choice.profile, choice.reason));
   }
 
   console.log(`CHANGE profile ${current.profile ?? "none (full requirements)"} -> ${choice.profile}`);
   const next = { ...current, profile: choice.profile };
+  printCostSettings(next);
   const kept = new Set(requiredPaths(repo, next));
   for (const path of requiredPaths(repo, current)) {
     if (!kept.has(path) && existsSync(join(repo, path))) {
