@@ -22,3 +22,7 @@ Added beyond the source: the optional `delegate` module. The main agent plans an
 reviews on the strongest model, and `worker` agents do the edits on the cheaper model
 forced in `.claude/settings.json`. A worker lasts for one brief, so this is not a
 persistent fleet.
+
+Also added: skill vetting in `core`. Third-party skills, plugins and MCP servers are
+scanned with SkillSpector before an agent adds them. A missing scanner or partial
+scan is "could not verify", not a pass.

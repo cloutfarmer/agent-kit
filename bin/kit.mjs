@@ -25,8 +25,9 @@ const REQUIRED_DOCS = [
 ];
 const AGENTS_SECTIONS = [
   "Repository", "Start here", "Safety rules", "Engineering invariants", "Working standard",
-  "Session budget",
+  "Skill vetting", "Session budget",
 ];
+const CORE_SECTIONS = ["Skill vetting"];
 const DOCS_ROOT_ALLOWED = new Set([
   "README.md", "STATUS.md", "TESTING.md", "SECURITY.md", "ROADMAP.md",
   "plans", "operations", "decisions", "history",
@@ -40,33 +41,59 @@ const TEMPLATE_FILES = [
   ".claude/settings.json",
 ];
 const SETTINGS_PATH = ".claude/settings.json";
-const FRESHNESS_SCRIPT = ".agent/freshness.mjs";
+const REQUIRED_HOOKS = [
+  { event: "SessionStart", script: ".agent/freshness.mjs" },
+  { event: "UserPromptSubmit", script: ".agent/skill-gate.mjs" },
+];
 const DELEGATE_SECTION = "Delegation";
 const SUBAGENT_MODEL = "CLAUDE_CODE_SUBAGENT_MODEL";
 const SUBAGENT_FORCE = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
 
 class CouldNotVerify extends Error {}
 
-// Returns why .claude/settings.json doesn't run the freshness hook at session start, or null.
-function settingsProblem(repo) {
+// Returns why .claude/settings.json doesn't register each required hook. Empty when it does.
+function settingsProblems(repo) {
   const path = join(repo, SETTINGS_PATH);
-  if (!existsSync(path)) return `${SETTINGS_PATH}: required file is missing`;
+  if (!existsSync(path)) return [`${SETTINGS_PATH}: required file is missing`];
   let settings;
   try {
     settings = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return `${SETTINGS_PATH}: not valid JSON`;
+    return [`${SETTINGS_PATH}: not valid JSON`];
   }
-  const groups = settings?.hooks?.SessionStart;
-  const registered = Array.isArray(groups) && groups.some((group) =>
-    Array.isArray(group?.hooks) && group.hooks.some((hook) =>
-      typeof hook?.command === "string" && hook.command.includes(FRESHNESS_SCRIPT)));
-  return registered ? null : `${SETTINGS_PATH}: no SessionStart hook runs ${FRESHNESS_SCRIPT}`;
+  return REQUIRED_HOOKS.filter(({ event, script }) => {
+    const groups = settings?.hooks?.[event];
+    return !(Array.isArray(groups) && groups.some((group) =>
+      Array.isArray(group?.hooks) && group.hooks.some((hook) =>
+        typeof hook?.command === "string" && hook.command.includes(script))));
+  }).map(({ event, script }) => `${SETTINGS_PATH}: no ${event} hook runs ${script}`);
 }
 
-function settingsNote(problem) {
+function printSettingsNotes(problems) {
+  if (!problems.length) return;
+  for (const problem of problems) console.log(`NOTE ${problem}; left unchanged.`);
   const snippet = readFileSync(join(KIT_ROOT, "templates", SETTINGS_PATH), "utf8").trim();
-  return `NOTE ${problem}; left unchanged. Add this hook:\n${snippet}`;
+  console.log(`Add these hooks:\n${snippet}`);
+}
+
+// Returns the "## <name>" section of the AGENTS.md template, up to the next section.
+function templateSection(name) {
+  const text = readFileSync(join(KIT_ROOT, "templates/AGENTS.md"), "utf8");
+  const start = text.search(new RegExp(`^## ${name}\\s*$`, "m"));
+  const rest = text.slice(start + 3);
+  const next = rest.search(/^## /m);
+  return text.slice(start, next < 0 ? undefined : start + 3 + next).trim();
+}
+
+// Prints core AGENTS.md sections an existing file lacks. The kit never edits that file.
+function printSectionNotes(repo) {
+  const path = join(repo, "AGENTS.md");
+  if (!existsSync(path)) return;
+  const agents = readFileSync(path, "utf8");
+  for (const section of CORE_SECTIONS.filter((name) => !hasSection(agents, name))) {
+    console.log(`NOTE AGENTS.md: missing section "## ${section}"; left unchanged. Add this section:\n`
+      + templateSection(section));
+  }
 }
 
 function delegateSnippet(name) {
@@ -286,8 +313,7 @@ export function runCheck(repo, { latestVersion } = {}) {
       if (!hasSection(agents, section)) failures.push(`AGENTS.md: missing section "## ${section}"`);
     }
   }
-  const settings = settingsProblem(repo);
-  if (settings) failures.push(settings);
+  failures.push(...settingsProblems(repo));
   if (policy.modules.includes("delegate")) {
     failures.push(...delegateProblems(repo).map((problem) => problem.text));
   }
@@ -478,10 +504,8 @@ function adopt(repo, options) {
       projectFiles.set(ciPath, renderCi(repo, policy.ci_job, policy.scan_command, policy.base_branch));
     }
   }
-  if (!projectFiles.has(SETTINGS_PATH)) {
-    const problem = settingsProblem(repo);
-    if (problem) console.log(settingsNote(problem));
-  }
+  if (!projectFiles.has(SETTINGS_PATH)) printSettingsNotes(settingsProblems(repo));
+  if (!projectFiles.has("AGENTS.md")) printSectionNotes(repo);
   if (delegate) printDelegateNotes(delegateProblems(repo).filter((problem) => !projectFiles.has(problem.path)));
 
   for (const path of creates) console.log(`CREATE managed ${path}`);
@@ -520,8 +544,8 @@ function sync(repo, options) {
     .filter((path) => !managed.has(path) && existsSync(join(repo, path)));
   for (const path of updates) console.log(`UPDATE ${path}`);
   for (const path of removals) console.log(`REMOVE ${path}`);
-  const settings = settingsProblem(repo);
-  if (settings) console.log(settingsNote(settings));
+  printSettingsNotes(settingsProblems(repo));
+  printSectionNotes(repo);
   if (policy.modules.includes("delegate")) printDelegateNotes(delegateProblems(repo));
   console.log(`Kit ${lock.version} -> ${VERSION}`);
 

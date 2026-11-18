@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.0
+
+- New managed `.agent/skill-gate.mjs` in `core`: a UserPromptSubmit hook. When a prompt
+  mentions a skill, plugin or MCP server, it reminds the agent to scan it with
+  [SkillSpector](https://github.com/NVIDIA/SkillSpector) before adding it. It says
+  "could not verify" when SkillSpector isn't installed. It never blocks a prompt.
+- `AGENTS.md` now requires a `## Skill vetting` section: a static `--no-llm` scan first,
+  a `claude_cli` LLM rescan on CAUTION, no install on DO_NOT_INSTALL or could-not-verify.
+- `check` now requires a UserPromptSubmit hook that runs `.agent/skill-gate.mjs` in
+  `.claude/settings.json`. `adopt` adds the section and the hook to files it creates.
+  `adopt` and `sync` print both when an existing file lacks them, so add them in the
+  1.4.0 sync PR.
+
 ## 1.3.0
 
 - New optional `delegate` module: a managed `.claude/agents/worker.md`. The main
