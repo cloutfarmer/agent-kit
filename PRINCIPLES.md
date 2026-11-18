@@ -33,3 +33,8 @@ every safeguard is worth its cost. Across many small repos, a learning sandbox a
 with other people's data need different amounts of process, so each repo declares its
 purpose and the kit applies only what that purpose justifies. The safety floor (guard,
 skill vetting, secret rules) is the same for all of them.
+
+Also added: token cost as a visible setting. Automatic review runs only when the repo's
+`review_trigger` asks for it, never on a push, and the rule is read from the base branch
+so a PR can't change it. `AGENTS.md` is loaded into every session, so each profile has a
+word budget that `kit check` warns about.

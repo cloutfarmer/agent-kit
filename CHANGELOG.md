@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.9.0
+
+- Optional `review_trigger` in `.agent/policy.yml`: `manual`, `label` or `ready`. It
+  decides when `agent-brief` runs an AI review. `manual` never does; `label` reviews when
+  `claude-review` is added; `ready` also reviews when a PR is opened, reopened or marked
+  ready for review. Defaults: `manual` for `sandbox`, `label` for `personal`, `ready` for
+  `public`, `product` and repos with no profile. An invalid value is "could not verify".
+- `agent-brief` no longer reviews when commits are pushed. A push now removes
+  `agent/ready`, `human/design` and `human/sensitive`, because they described an older
+  commit. Add `claude-review` for a new brief.
+- The `prepare` job, which has no agent, reads `review_trigger` from the base branch's
+  policy through the GitHub API, so a PR can't change its own rule. It gains
+  `contents: read` for this. If the policy can't be read or is invalid, no review runs and
+  the PR gets `agent/could-not-verify`. This includes the PR that first adds the kit.
+- Word budgets for `AGENTS.md`: 300 for `sandbox`, 600 for `personal`, 800 for `public`,
+  1000 for `product`. `check` warns, and still passes, when the file is over budget.
+  Optional `agents_md_words` sets a repo's own budget. Repos with no profile get no
+  budget unless they set it.
+- `init` and `init --reassess` print the review trigger and word budget that apply.
+- The policy template lists both settings as comments.
+
 ## 1.8.0
 
 - `delegate`: the worker now merges the task branch before it reads `AGENTS.md` or

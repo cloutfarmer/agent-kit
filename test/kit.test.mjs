@@ -169,8 +169,10 @@ function briefJob(name) {
 
 test("agent-brief skips the review when the token is missing", () => {
   assert.match(briefJob("prepare"), /HAS_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN != '' \}\}/);
-  assert.match(briefJob("review"), /if: needs\.prepare\.outputs\.present == 'true'/);
-  assert.match(briefJob("publish"), /if: always\(\) && needs\.prepare\.outputs\.present == 'true'/);
+  assert.match(briefJob("prepare"),
+    /review: \$\{\{ steps\.decide\.outputs\.review == 'true' && steps\.token\.outputs\.present == 'true' \}\}/);
+  assert.match(briefJob("review"), /if: needs\.prepare\.outputs\.review == 'true'/);
+  assert.match(briefJob("publish"), /if: always\(\) && needs\.prepare\.outputs\.review == 'true'/);
   assert.match(briefJob("fix"), /uses: anthropics[\s\S]*/);
   assert.match(briefJob("fix"), /- id: claude\n\s+if: steps\.token\.outputs\.present == 'true'/);
 });
@@ -205,15 +207,22 @@ test("managed workflows pin every action and keep PR text out of shell code", ()
   }
 });
 
-function publish(brief, { result = "success", existing = "0" } = {}) {
+// Returns the shell script of the agent-brief step with this name.
+function stepScript(name) {
   const lines = readFileSync(BRIEF_WORKFLOW, "utf8").split("\n");
-  const start = lines.findIndex((line) => line.includes("name: Publish the brief"));
+  const start = lines.findIndex((line) => line.includes(`name: ${name}`));
+  assert.ok(start >= 0, `step ${name} is missing`);
   const run = lines.findIndex((line, index) => index > start && line.trim() === "run: |");
   const script = [];
   for (const line of lines.slice(run + 1)) {
     if (line && !line.startsWith("          ")) break;
     script.push(line.slice(10));
   }
+  return script.join("\n");
+}
+
+function publish(brief, { result = "success", existing = "0" } = {}) {
+  const script = stepScript("Publish the brief").split("\n");
   const dir = tempDir();
   const log = join(dir, "gh.log");
   writeFileSync(join(dir, "gh"), `#!/usr/bin/env bash
@@ -951,7 +960,7 @@ test("the skill gate says a missing scanner means could not verify", () => {
   assert.match(reminder, /could not verify/);
 });
 
-const { PROFILES, recommend } = await import(KIT);
+const { PROFILES, REVIEW_TRIGGERS, countWords, recommend, requirements } = await import(KIT);
 
 const ANSWERS = {
   sandbox: { goal: "learning", users: "only-me", public: "no", deployed: "no", data: "none", services: "none", recovery: "easy" },
@@ -1193,4 +1202,209 @@ test("every profile works with delegate, the verifier and setup_command", () => 
     assert.equal(result.status, 0, `${profile}: ${result.out}`);
     assert.match(readFileSync(join(repo, ".agent/policy.yml"), "utf8"), new RegExp(`^profile: ${profile}$`, "m"));
   }
+});
+
+// Runs the "Decide whether to review" step with a fake gh. policy is the base branch's
+// .agent/policy.yml, or null when the API can't return it.
+function decide(policy, { action = "opened", label = "", base = "main" } = {}) {
+  const dir = tempDir();
+  const log = join(dir, "gh.log");
+  if (policy !== null) writeFileSync(join(dir, "policy.yml"), policy);
+  writeFileSync(join(dir, "gh"), `#!/usr/bin/env bash
+printf 'gh' >> "${log}"; printf ' [%s]' "$@" >> "${log}"; echo >> "${log}"
+if [[ "$1" == "api" ]]; then
+  [[ -f "${join(dir, "policy.yml")}" ]] || { echo "HTTP 404: Not Found" >&2; exit 1; }
+  cat "${join(dir, "policy.yml")}"
+fi
+`, { mode: 0o755 });
+  writeFileSync(join(dir, "out"), "");
+  const run = spawnSync("bash", ["-c", stepScript("Decide whether to review")], {
+    cwd: dir,
+    encoding: "utf8",
+    env: {
+      ...process.env, PATH: `${dir}:${process.env.PATH}`, GH_REPO: "o/r", PR: "7", BASE_REF: base,
+      ACTION: action, LABEL: label, GITHUB_OUTPUT: join(dir, "out"), GITHUB_STEP_SUMMARY: join(dir, "summary"),
+    },
+  });
+  const read = (name) => (existsSync(join(dir, name)) ? readFileSync(join(dir, name), "utf8") : "");
+  return {
+    status: run.status, out: run.stdout + run.stderr, gh: read("gh.log"),
+    review: read("out").match(/^review=(.*)$/m)?.[1] ?? null,
+  };
+}
+
+const POLICY = "modules: [core, review, triage]\nbase_branch: main\nci_job: ci\nscan_command: x\n";
+const EVENTS = [["opened"], ["reopened"], ["ready_for_review"], ["labeled", "claude-review"], ["labeled", "claude-fix"]];
+
+test("each review_trigger starts a review only on its events", () => {
+  const expected = {
+    manual: [false, false, false, false, false],
+    label: [false, false, false, true, false],
+    ready: [true, true, true, true, false],
+  };
+  for (const [trigger, wants] of Object.entries(expected)) {
+    EVENTS.forEach(([action, label], index) => {
+      const result = decide(`${POLICY}review_trigger: ${trigger}\n`, { action, label });
+      assert.equal(result.status, 0, `${trigger} ${action}: ${result.out}`);
+      assert.equal(result.review, String(wants[index]), `${trigger} ${action} ${label}`);
+      assert.doesNotMatch(result.gh, /pr edit/, "deciding changes no labels");
+    });
+  }
+  assert.match(decide(`${POLICY}review_trigger: manual\n`, { action: "labeled", label: "claude-review" }).out,
+    /SKIPPED review_trigger is manual .*Run \/pr-triage locally/);
+  assert.match(decide(`${POLICY}review_trigger: label\n`).out, /Add the claude-review label/);
+});
+
+test("each profile has its default review_trigger, the same in kit and the workflow", () => {
+  const defaults = { sandbox: "manual", personal: "label", public: "ready", product: "ready" };
+  for (const profile of PROFILES) {
+    assert.equal(requirements(profile).reviewTrigger, defaults[profile], profile);
+    const opened = decide(`${POLICY}profile: ${profile}\nprofile_reason: "x # y"\n`);
+    const labeled = decide(`${POLICY}profile: "${profile}"  # chosen\n`, { action: "labeled", label: "claude-review" });
+    assert.equal(opened.status, 0, opened.out);
+    assert.equal(opened.review, String(defaults[profile] === "ready"), profile);
+    assert.equal(labeled.review, String(defaults[profile] !== "manual"), profile);
+    assert.match(opened.out, new RegExp(`default for ${profile}`));
+  }
+  assert.equal(requirements().reviewTrigger, "ready");
+  const none = decide(POLICY);
+  assert.equal(none.review, "true", none.out);
+  assert.match(none.out, /default with no profile/);
+  const override = decide(`${POLICY}profile: product\nreview_trigger: 'label' # cheaper\n`);
+  assert.equal(override.review, "false", override.out);
+  assert.match(override.out, /set in the base branch policy/);
+});
+
+test("an unreadable or invalid base policy starts no review and says could not verify", () => {
+  for (const policy of [null, `${POLICY}review_trigger: sometimes\n`, `${POLICY}review_trigger:\n`,
+    `${POLICY}review_trigger: label\nreview_trigger: ready\n`, `${POLICY}profile: enterprise\n`,
+    `${POLICY}review_trigger: Ready\n`]) {
+    const result = decide(policy, { action: "labeled", label: "claude-review" });
+    assert.equal(result.status, 1, `${policy}: ${result.out}`);
+    assert.notEqual(result.review, "true");
+    assert.match(result.out, /COULD NOT VERIFY .*No review ran/);
+    assert.match(result.gh, /gh \[pr\] \[edit\] \[7\] .*\[--add-label\] \[agent\/could-not-verify\]/);
+  }
+});
+
+test("the review rule comes from the base branch through the API, not the PR", () => {
+  const result = decide(`${POLICY}review_trigger: ready\n`, { base: "release/1.x" });
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.gh,
+    /gh \[api\] \[--method\] \[GET\] \[repos\/o\/r\/contents\/\.agent\/policy\.yml\] \[-f\] \[ref=release\/1\.x\]/);
+  const prepare = briefJob("prepare");
+  assert.doesNotMatch(prepare, /actions\/checkout|claude-code-action|head\.(sha|ref)/);
+  assert.match(prepare, /BASE_REF: \$\{\{ github\.event\.pull_request\.base\.ref \}\}/);
+  // The only permission added for this is read access to contents.
+  assert.match(prepare, /permissions:\n\s+contents: read\n\s+issues: write\n\s+pull-requests: write\n\s+outputs:/);
+  assert.match(prepare, /- name: Decide whether to review\n\s+id: decide\n\s+if: github\.event\.action != 'synchronize'/);
+});
+
+// Runs the "Clear labels from an older commit" step with a fake gh that reports these labels.
+function clearOnPush(labels) {
+  const dir = tempDir();
+  const log = join(dir, "gh.log");
+  writeFileSync(join(dir, "gh"), `#!/usr/bin/env bash
+printf 'gh' >> "${log}"; printf ' [%s]' "$@" >> "${log}"; echo >> "${log}"
+if [[ "$1 $2" == "pr view" ]]; then printf '%s\\n' ${labels.map((name) => `'${name}'`).join(" ")}; fi
+`, { mode: 0o755 });
+  const run = spawnSync("bash", ["-c", stepScript("Clear labels from an older commit")], {
+    cwd: dir, encoding: "utf8", env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, GH_REPO: "o/r", PR: "7" },
+  });
+  return { status: run.status, out: run.stdout + run.stderr, gh: existsSync(log) ? readFileSync(log, "utf8") : "" };
+}
+
+test("a push clears the old verdict labels and never starts a review", () => {
+  const result = clearOnPush(["agent/ready", "human/sensitive", "agent/could-not-verify", "bug"]);
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.gh, /gh \[pr\] \[edit\] \[7\] \[--remove-label\] \[agent\/ready\] \[--remove-label\] \[human\/sensitive\]\n/);
+  assert.doesNotMatch(result.gh, /remove-label\] \[(bug|agent\/could-not-verify|human\/design)\]/);
+  const design = clearOnPush(["human/design"]);
+  assert.match(design.gh, /\[--remove-label\] \[human\/design\]/);
+  const none = clearOnPush(["bug"]);
+  assert.equal(none.status, 0, none.out);
+  assert.doesNotMatch(none.gh, /pr edit|\[edit\]/);
+
+  const prepare = briefJob("prepare");
+  assert.match(prepare, /- name: Clear labels from an older commit\n\s+if: github\.event\.action == 'synchronize'/);
+  // On a push the decide step is skipped, so its output is empty and review stays false.
+  assert.match(prepare, /if: steps\.decide\.outputs\.review == 'true'\n/);
+  assert.match(prepare, /github\.event\.action == 'synchronize' \|\|/);
+  assert.doesNotMatch(stepScript("Decide whether to review"), /synchronize/);
+});
+
+test("kit check: an invalid review_trigger or agents_md_words is could not verify", () => {
+  for (const line of ["review_trigger: always", "review_trigger:", "agents_md_words: lots",
+    "agents_md_words: 0", "agents_md_words: -5"]) {
+    const repo = adopted();
+    appendFileSync(join(repo, ".agent/policy.yml"), `${line}\n`);
+    const result = kit(repo, "check");
+    assert.equal(result.status, 2, `${line}: ${result.out}`);
+    assert.match(result.out, /COULD NOT VERIFY .*(review_trigger|agents_md_words)/);
+  }
+  for (const trigger of REVIEW_TRIGGERS) {
+    const repo = adopted();
+    appendFileSync(join(repo, ".agent/policy.yml"), `review_trigger: ${trigger}\n`);
+    assert.equal(kit(repo, "check").status, 0, trigger);
+  }
+});
+
+function padAgents(repo, words) {
+  const path = join(repo, "AGENTS.md");
+  const extra = words - countWords(readFileSync(path, "utf8"));
+  if (extra > 0) appendFileSync(path, `\n${"word ".repeat(extra)}\n`);
+}
+
+test("kit check warns when AGENTS.md is over its profile's word budget, and still passes", () => {
+  const budgets = { sandbox: 300, personal: 600, public: 800, product: 1000 };
+  for (const profile of PROFILES) {
+    assert.equal(requirements(profile).agentsMdWords, budgets[profile]);
+    const repo = initRepo(profile);
+    const fresh = kit(repo, "check");
+    assert.equal(fresh.status, 0, fresh.out);
+    assert.doesNotMatch(fresh.out, /over the budget/, `${profile} starts within budget`);
+    padAgents(repo, budgets[profile]);
+    assert.doesNotMatch(kit(repo, "check").out, /over the budget/, `${profile} at the budget`);
+    appendFileSync(join(repo, "AGENTS.md"), "one more\n");
+    const over = kit(repo, "check");
+    assert.equal(over.status, 0, over.out);
+    assert.match(over.out, new RegExp(`WARN AGENTS\\.md: ${budgets[profile] + 2} words, over the budget of ${budgets[profile]} from the ${profile} profile`));
+  }
+});
+
+test("agents_md_words sets a repo's own budget; no profile means no budget unless set", () => {
+  const none = adopted();
+  padAgents(none, 5000);
+  assert.doesNotMatch(kit(none, "check").out, /over the budget/);
+  appendFileSync(join(none, ".agent/policy.yml"), "agents_md_words: 4000\n");
+  assert.match(kit(none, "check").out, /WARN AGENTS\.md: 5000 words, over the budget of 4000 from agents_md_words/);
+
+  const roomy = initRepo("sandbox");
+  padAgents(roomy, 400);
+  assert.match(kit(roomy, "check").out, /over the budget of 300/);
+  appendFileSync(join(roomy, ".agent/policy.yml"), "agents_md_words: \"450\"\n");
+  const result = kit(roomy, "check");
+  assert.equal(result.status, 0, result.out);
+  assert.doesNotMatch(result.out, /over the budget/);
+});
+
+test("init and reassess show the review trigger and word budget", () => {
+  const repo = tempDir();
+  git(repo, "init", "-q", "-b", "main");
+  const dry = kit(repo, "init", ...answerFlags(ANSWERS.personal));
+  assert.match(dry.out, /TRIGGER agent-brief review_trigger: label \(default for personal; set review_trigger/);
+  assert.match(dry.out, /BUDGET AGENTS\.md: 600 words \(default for personal; set agents_md_words/);
+
+  const adoptedRepo = initRepo("personal");
+  appendFileSync(join(adoptedRepo, ".agent/policy.yml"), "review_trigger: manual\n");
+  const reassess = kit(adoptedRepo, "init", "--reassess", ...answerFlags(ANSWERS.product));
+  assert.equal(reassess.status, 0, reassess.out);
+  assert.match(reassess.out, /TRIGGER agent-brief review_trigger: manual \(set in \.agent\/policy\.yml; the product default is ready\)/);
+  assert.match(reassess.out, /BUDGET AGENTS\.md: 1000 words \(default for product/);
+
+  const legacy = adopted("core");
+  const first = kit(legacy, "init", "--reassess", ...answerFlags(ANSWERS.sandbox), "--write");
+  assert.equal(first.status, 0, first.out);
+  assert.match(first.out, /review_trigger: manual \(default for sandbox/);
+  assert.match(readFileSync(join(legacy, ".agent/policy.yml"), "utf8"), /^# review_trigger: label$/m);
 });
