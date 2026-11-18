@@ -82,6 +82,37 @@ profile doesn't need is not installed or required. If a repo adds one anyway, su
 A repo with no `profile` in its policy keeps the full requirements, so repos adopted
 before 1.7.0 stay valid. An unknown profile is "could not verify".
 
+### Token costs: review trigger and word budget
+
+Two settings in `.agent/policy.yml` control what the kit spends on AI tokens. Both are
+optional, and each profile has a default.
+
+| Profile | `review_trigger` default | `agents_md_words` default |
+|---|---|---|
+| `sandbox` | `manual` | 300 |
+| `personal` | `label` | 600 |
+| `public` | `ready` | 800 |
+| `product` | `ready` | 1000 |
+| no profile | `ready` | none |
+
+`review_trigger` decides when the `agent-brief` workflow runs an AI review:
+
+- `manual`: never. Run `/pr-triage` yourself in a Claude Code session when you want one.
+- `label`: only when someone adds the `claude-review` label.
+- `ready`: when a PR is opened, reopened or marked ready for review, and on `claude-review`.
+
+Pushing new commits never starts a review. It removes `agent/ready`, `human/design` and
+`human/sensitive`, because those described an older commit. Add `claude-review` for a
+new brief. `check` treats any other value as "could not verify".
+
+`agents_md_words` is a word budget for `AGENTS.md`. Claude Code loads that file into
+every session, so every word costs tokens on every task. `check` prints a `WARN` with the
+current count and the budget when the file is over it, and still passes. A repo with no
+profile gets no budget unless it sets `agents_md_words`. The `delegate` section adds
+about 340 words, so a repo with `delegate` on may need a higher budget.
+
+`init` and `init --reassess` print both settings as `TRIGGER` and `BUDGET` lines.
+
 ### `kit init`
 
 `init` asks seven questions and recommends a profile. Without a terminal, such as in a
@@ -219,7 +250,15 @@ Add `CLAUDE_CODE_OAUTH_TOKEN` to the repo's Actions secrets and install the Clau
 GitHub App. Without the secret, `agent-brief` skips with a warning instead of failing,
 and no review runs.
 
-`agent-brief` reviews with read-only access, then a separate job with no agent checks and
+`agent-brief` starts a review only when the repo's `review_trigger` says to (see
+[Token costs](#token-costs-review-trigger-and-word-budget)). Its `prepare` job, which has no
+agent, reads that setting from `.agent/policy.yml` on the PR's base branch through the
+GitHub API, so a PR can't change its own rule. It needs `contents: read` for this. If the
+policy can't be read or the setting is invalid, no review runs and the PR gets
+`agent/could-not-verify`. The first PR that adds the kit to a repo gets this label too,
+because the base branch has no policy yet.
+
+The review itself has read-only access. A separate job with no agent then checks and
 publishes the result. Add the `claude-fix` label to a PR when you want the agent to push
 its allowed fixes. Add `claude-review` to review it again.
 

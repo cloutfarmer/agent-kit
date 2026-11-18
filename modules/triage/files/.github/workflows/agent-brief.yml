@@ -1,6 +1,9 @@
 name: agent-brief
 
-# Managed by agent-kit. Reviews each non-draft PR and leaves one brief and one label.
+# Managed by agent-kit. Leaves one brief and one label on a PR when review_trigger in the
+# base branch's .agent/policy.yml says to: manual (never), label (on claude-review) or
+# ready (opened, reopened, ready for review, and claude-review). Pushing commits never
+# starts a review; it only removes labels that described an older commit.
 # The review job can read the repo but can't write to GitHub. A separate job with no
 # agent publishes its checked result. Fixes run only when a person adds claude-fix.
 # Nothing here merges. Skips with a warning when CLAUDE_CODE_OAUTH_TOKEN is not set.
@@ -15,30 +18,124 @@ on:
 permissions: {}
 
 # Events this workflow ignores get their own group, so labels and fix commits can't
-# cancel a running review.
+# cancel a running review. A push does cancel one, because its result would be stale.
 concurrency:
   group: agent-brief-${{ github.event.pull_request.number }}-${{ ((github.event.action == 'labeled' && github.event.label.name != 'claude-review') || github.actor == 'claude[bot]') && github.run_id || 'review' }}
   cancel-in-progress: true
 
 jobs:
+  # No agent. Decides whether to review, and clears stale labels after a push.
   prepare:
     if: >-
-      github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'claude[bot]' &&
-      (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
+      (github.event.action == 'synchronize' ||
+        (github.event.pull_request.draft == false &&
+          github.actor != 'claude[bot]' &&
+          (github.event.action != 'labeled' || github.event.label.name == 'claude-review')))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # contents: read is only for reading .agent/policy.yml from the base branch.
     permissions:
+      contents: read
       issues: write
       pull-requests: write
     outputs:
-      present: ${{ steps.token.outputs.present }}
+      review: ${{ steps.decide.outputs.review == 'true' && steps.token.outputs.present == 'true' }}
     steps:
+      # A new commit makes the last brief out of date, so its verdict labels come off.
+      - name: Clear labels from an older commit
+        if: github.event.action == 'synchronize'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          current="$(gh pr view "$PR" --json labels --jq '.labels[].name')"
+          remove=()
+          for label in agent/ready human/design human/sensitive; do
+            if grep -Fxq -- "$label" <<<"$current"; then remove+=(--remove-label "$label"); fi
+          done
+          if (( ${#remove[@]} )); then
+            gh pr edit "$PR" "${remove[@]}"
+            echo "CLEARED brief labels: they described an older commit. Add claude-review for a new brief."
+          else
+            echo "PASS no brief labels to clear"
+          fi
+
+      # Reads the rule from the base branch through the API, so a PR can't change its own rule.
+      - name: Decide whether to review
+        id: decide
+        if: github.event.action != 'synchronize'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          could_not_verify() {
+            gh label create agent/could-not-verify --force --color D93F0B --description "Review did not complete" || true
+            gh pr edit "$PR" --remove-label agent/ready --remove-label human/design \
+              --remove-label human/sensitive --add-label agent/could-not-verify || true
+            echo "COULD NOT VERIFY $1. No review ran." | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
+          if ! policy="$(gh api --method GET "repos/$GH_REPO/contents/.agent/policy.yml" \
+            -f ref="$BASE_REF" -H "Accept: application/vnd.github.raw+json")"; then
+            could_not_verify "can't read .agent/policy.yml from the base branch"
+          fi
+          policy="$(tr -d '\r' <<<"$policy")"
+          # Prints "=value" for a top-level key, or nothing when the key is absent.
+          # A repeated key prints two lines, which no check below accepts.
+          setting() {
+            local found
+            found="$(grep -E "^$1:" <<<"$policy" || true)"
+            [[ -n "$found" ]] || return 0
+            sed -E "s/^$1:[[:space:]]*//; s/^\"([^\"]*)\"([[:space:]]+#.*)?\$/\\1/; s/^'([^']*)'([[:space:]]+#.*)?\$/\\1/; s/[[:space:]]+#.*\$//; s/[[:space:]]+\$//; s/^/=/" <<<"$found"
+          }
+          trigger="$(setting review_trigger)"
+          profile="$(setting profile)"
+          if [[ -n "$trigger" ]]; then
+            trigger="${trigger#=}"
+            from="set in the base branch policy"
+          else
+            case "$profile" in
+              =sandbox) trigger=manual ;;
+              =personal) trigger=label ;;
+              =public | =product | "") trigger=ready ;;
+              *) could_not_verify "the base branch policy has an unknown profile" ;;
+            esac
+            from="default for ${profile#=}"
+            [[ -n "$profile" ]] || from="default with no profile"
+          fi
+          case "$trigger" in
+            manual | label | ready) ;;
+            *) could_not_verify "review_trigger in the base branch policy must be manual, label or ready" ;;
+          esac
+          review=false
+          case "$ACTION" in
+            labeled) [[ "$LABEL" == "claude-review" && "$trigger" != "manual" ]] && review=true ;;
+            opened | reopened | ready_for_review) [[ "$trigger" == "ready" ]] && review=true ;;
+          esac
+          echo "review=$review" >> "$GITHUB_OUTPUT"
+          if [[ "$review" == "true" ]]; then
+            echo "REVIEW review_trigger is $trigger ($from)"
+          elif [[ "$trigger" == "manual" ]]; then
+            echo "SKIPPED review_trigger is manual ($from). Run /pr-triage locally for a review." | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          else
+            echo "SKIPPED review_trigger is $trigger ($from). Add the claude-review label for a review." | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
+
       # Secrets can't be read in a job-level if, so map the secret to a boolean here.
       # The value itself is never printed.
       - name: Check for the Claude token
         id: token
+        if: steps.decide.outputs.review == 'true'
         shell: bash
         env:
           HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
@@ -52,7 +149,7 @@ jobs:
           fi
 
       - name: Reset brief labels
-        if: steps.token.outputs.present == 'true'
+        if: steps.decide.outputs.review == 'true' && steps.token.outputs.present == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -72,7 +169,7 @@ jobs:
 
   review:
     needs: prepare
-    if: needs.prepare.outputs.present == 'true'
+    if: needs.prepare.outputs.review == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -113,7 +210,7 @@ jobs:
   # No checkout and no agent: this job treats the review result as untrusted data.
   publish:
     needs: [prepare, review]
-    if: always() && needs.prepare.outputs.present == 'true'
+    if: always() && needs.prepare.outputs.review == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
