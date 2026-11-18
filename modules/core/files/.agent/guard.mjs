@@ -3,6 +3,7 @@
 // Exit 0 allows the tool call. Exit 2 blocks it and shows the reason to the agent.
 // This is a guardrail, not a sandbox: a program started from Bash can still do what
 // this hook can't see. Set KIT_GUARD=off before starting Claude Code to turn it off.
+// A read-only agent, such as the delegate module's verifier, also can't edit or write files.
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
@@ -19,6 +20,11 @@ const WRITING_COMMANDS = new Set([
   "chmod", "chown", "cp", "dd", "install", "ln", "mv", "rm", "rmdir", "tee", "touch", "truncate",
 ]);
 const WRITING_GIT = new Set(["checkout", "mv", "restore", "rm"]);
+// Agents that must never change the repo. Claude Code names the agent in agent_type.
+const READ_ONLY_AGENTS = new Set(["verifier"]);
+const READ_ONLY_AGENT_GIT = new Set([
+  ...READ_ONLY_GIT, "blame", "cat-file", "describe", "ls-files", "merge-base", "rev-list", "rev-parse", "shortlog",
+]);
 
 class Blocked extends Error {}
 
@@ -161,10 +167,39 @@ function checkBash(command, startDir, projectDir) {
   }
 }
 
+// The git subcommand, after options such as -C <dir> or --no-pager.
+function gitSubcommand(list) {
+  for (let i = 1; i < list.length; i += 1) {
+    if (["-C", "-c"].includes(list[i])) i += 1;
+    else if (!list[i].startsWith("-")) return list[i];
+  }
+  return "";
+}
+
+// A read-only agent may run checks, but no command that writes files or changes git state.
+function checkReadOnlyAgent(tool, args, agent) {
+  if (EDIT_TOOLS.has(tool)) throw new Blocked(`the ${agent} agent is read-only and can't use ${tool}`);
+  if (tool !== "Bash") return;
+  for (const segment of String(args.command ?? "").split(/&&|\|\||[;|\n]/)) {
+    const list = commandWords(segment.replace(/\d?>>?\s*\S+|<\s*\S+/g, " "));
+    const target = [...segment.matchAll(/\d?>>?\s*([^\s;|&]+)/g)].map((match) => match[1])
+      .find((path) => !path.startsWith("/dev/"));
+    if (target) throw new Blocked(`the ${agent} agent is read-only and can't write to ${target}`);
+    const [command] = list;
+    const findWrites = command === "find"
+      && list.some((word) => ["-delete", "-exec", "-execdir", "-ok", "-fprint"].includes(word));
+    if (writesFiles(list) || command === "xargs" || findWrites
+      || (command === "git" && !READ_ONLY_AGENT_GIT.has(gitSubcommand(list)))) {
+      throw new Blocked(`the ${agent} agent is read-only and can't run "${segment.trim()}"`);
+    }
+  }
+}
+
 export function evaluate(input, projectDir) {
   const tool = input.tool_name;
   const args = input.tool_input ?? {};
   const cwd = input.cwd || projectDir;
+  if (READ_ONLY_AGENTS.has(input.agent_type)) checkReadOnlyAgent(tool, args, input.agent_type);
   if (EDIT_TOOLS.has(tool)) checkEdit(args.file_path ?? args.notebook_path, cwd, projectDir);
   else if (tool === "Read") checkRead(args.file_path, cwd);
   else if (tool === "Grep") checkRead(args.path, cwd);

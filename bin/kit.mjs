@@ -41,7 +41,8 @@ const REQUIRED_HOOKS = [
   { event: "UserPromptSubmit", script: ".agent/skill-gate.mjs" },
   { event: "PreToolUse", script: ".agent/guard.mjs" },
 ];
-const OPTIONAL_SCALAR_KEYS = ["profile", "profile_reason"];
+// Settings a policy may leave out. A policy written before they existed stays valid.
+const OPTIONAL_SCALAR_KEYS = ["profile", "profile_reason", "setup_command"];
 
 // Each profile adds to the one before it. Exposure sets the security floor, stakes set
 // the amount of process. A repo with no profile keeps the full requirements above.
@@ -209,13 +210,26 @@ function hasSection(text, section) {
   return new RegExp(`^## ${section}\\s*$`, "m").test(text);
 }
 
+// Returns the body of "## <section>" up to the next "## " heading.
+function sectionText(text, section) {
+  const start = text.search(new RegExp(`^## ${section}\\s*$`, "m"));
+  const rest = text.slice(start).split("\n").slice(1).join("\n");
+  const next = rest.search(/^## /m);
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
 // Returns what the delegate module still needs in AGENTS.md and .claude/settings.json.
 // A missing or unreadable file is reported by the general checks, not here.
 function delegateProblems(repo) {
   const problems = [];
   const agentsPath = join(repo, "AGENTS.md");
-  if (existsSync(agentsPath) && !hasSection(readFileSync(agentsPath, "utf8"), DELEGATE_SECTION)) {
-    problems.push({ path: "AGENTS.md", text: `AGENTS.md: module delegate needs section "## ${DELEGATE_SECTION}"` });
+  if (existsSync(agentsPath)) {
+    const agents = readFileSync(agentsPath, "utf8");
+    if (!hasSection(agents, DELEGATE_SECTION)) {
+      problems.push({ path: "AGENTS.md", text: `AGENTS.md: module delegate needs section "## ${DELEGATE_SECTION}"` });
+    } else if (!/`verifier`/.test(sectionText(agents, DELEGATE_SECTION))) {
+      problems.push({ path: "AGENTS.md", text: `AGENTS.md: section "## ${DELEGATE_SECTION}" must tell the main agent when to run \`verifier\`` });
+    }
   }
   let settings = null;
   try {
@@ -307,6 +321,9 @@ export function parsePolicy(text) {
     const quoted = rawValue.match(/^("[^"]*"|'[^']*')(\s+#.*)?$/);
     const value = quoted ? quoted[1] : rawValue.replace(/\s+#.*$/, "");
     openList = null;
+    if (key === "setup_command" && !parseScalar(value)) {
+      throw new CouldNotVerify(`${POLICY_PATH} setting ${key} is empty; give a command or remove the line`);
+    }
     if (!LIST_KEYS.includes(key) && !SCALAR_KEYS.includes(key) && !OPTIONAL_SCALAR_KEYS.includes(key)) {
       throw new CouldNotVerify(`${POLICY_PATH} has an unknown setting: ${key}`);
     }

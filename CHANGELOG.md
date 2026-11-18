@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.8.0
+
+- `delegate`: the worker now merges the task branch before it reads `AGENTS.md` or
+  `.agent/policy.yml`, so it follows that branch's rules. Before, it read the rules from
+  the default branch its worktree started on.
+- `.agent/policy.yml` accepts an optional `setup_command`, such as `npm ci`. The worker
+  runs it after the merge and before editing, and stops if it fails. Policies without it
+  stay valid. An empty value is "could not verify".
+- New managed `.claude/agents/verifier.md` in `delegate`. It has only `Read`, `Grep`,
+  `Glob` and `Bash`, so it can't edit files or start agents. It checks a diff against
+  the briefs and owned paths, reruns the done-check, and reports in a fixed format with
+  "could not verify" for checks that can't run.
+- The guard blocks file edits and shell writes, commits, merges and branch switches
+  when the calling agent is `verifier`.
+- The `## Delegation` snippet tells the main agent to run the verifier once on the
+  combined task diff, and on any risky or failed brief. With `delegate` on, `check`
+  fails until that section names `verifier`. Update the section by hand in the 1.8.0
+  sync PR; `sync` prints the new text.
+- With `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on, the verifier runs on the worker model.
+  Claude Code has no per-agent override while the setting is on. The README documents
+  this, and the setting stays required. The minimum Claude Code version is corrected to
+  2.1.257, as in the current docs.
+
 ## 1.7.0
 
 - Optional `profile` in `.agent/policy.yml`: `sandbox`, `personal`, `public` or `product`,

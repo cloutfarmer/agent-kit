@@ -560,6 +560,7 @@ test("freshness with an unreachable origin is could-not-verify", () => {
 });
 
 const WORKER = ".claude/agents/worker.md";
+const VERIFIER = ".claude/agents/verifier.md";
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -568,6 +569,9 @@ function readJson(path) {
 test("adopt with delegate installs the worker, the section and the forced model", () => {
   const repo = adopted("core,delegate");
   assert.equal(existsSync(join(repo, WORKER)), true);
+  assert.equal(existsSync(join(repo, VERIFIER)), true);
+  assert.deepEqual(Object.keys(readJson(join(repo, ".agent/kit.lock")).files)
+    .filter((path) => path.startsWith(".claude/agents/")), [VERIFIER, WORKER]);
   assert.match(readFileSync(join(repo, "AGENTS.md"), "utf8"), /^## Delegation$/m);
   const settings = readJson(join(repo, ".claude/settings.json"));
   assert.equal(settings.env.CLAUDE_CODE_SUBAGENT_MODEL, "sonnet");
@@ -580,6 +584,7 @@ test("adopt with delegate installs the worker, the section and the forced model"
 test("without delegate, nothing of it is installed or required", () => {
   const repo = adopted();
   assert.equal(existsSync(join(repo, WORKER)), false);
+  assert.equal(existsSync(join(repo, VERIFIER)), false);
   assert.doesNotMatch(readFileSync(join(repo, "AGENTS.md"), "utf8"), /## Delegation/);
   assert.equal(readJson(join(repo, ".claude/settings.json")).env, undefined);
   assert.equal(kit(repo, "check").status, 0);
@@ -640,6 +645,7 @@ test("turning delegate on in an adopted repo: sync installs the worker and print
   const synced = kit(repo, "sync", "--write");
   assert.equal(synced.status, 0, synced.out);
   assert.match(synced.out, /UPDATE \.claude\/agents\/worker\.md/);
+  assert.match(synced.out, /UPDATE \.claude\/agents\/verifier\.md/);
   assert.match(synced.out, /Add this section to AGENTS\.md:\n## Delegation/);
   assert.match(synced.out, /Add these keys to \.claude\/settings\.json:/);
   assert.equal(readFileSync(join(repo, "AGENTS.md"), "utf8"), agentsBefore);
@@ -670,6 +676,68 @@ test("the worker is isolated, can't spawn agents, and leaves the model to settin
   assert.match(frontmatter, /^disallowedTools: Agent$/m);
   assert.doesNotMatch(frontmatter, /^model:/m);
   assert.match(text, /Never push/);
+});
+
+test("with delegate on, a Delegation section that never names the verifier fails", () => {
+  const repo = adopted("core,delegate");
+  const path = join(repo, "AGENTS.md");
+  writeFileSync(path, readFileSync(path, "utf8").replaceAll("`verifier`", "the checker"));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /section "## Delegation" must tell the main agent when to run `verifier`/);
+  // A mention in another section doesn't count.
+  appendFileSync(path, "\n## Notes\n\nWe also have a `verifier`.\n");
+  assert.equal(kit(repo, "check").status, 1);
+});
+
+test("editing the managed verifier fails", () => {
+  const repo = adopted("core,delegate");
+  appendFileSync(join(repo, VERIFIER), "\ntools: Read, Edit\n");
+  assert.match(kit(repo, "check").out, /FAIL \.claude\/agents\/verifier\.md: differs from kit/);
+});
+
+test("the worker merges the task branch before it reads the rules or edits", () => {
+  const text = readFileSync(join(KIT_ROOT, "modules/delegate/files", WORKER), "utf8");
+  const at = (pattern) => {
+    const index = text.search(pattern);
+    assert.notEqual(index, -1, String(pattern));
+    return index;
+  };
+  const merge = at(/git merge --no-edit <base branch>/);
+  const rules = at(/read `AGENTS\.md` and\s+`\.agent\/policy\.yml`/);
+  const brief = at(/^## \d\. Check the brief$/m);
+  const setup = at(/^## \d\. Set up$/m);
+  const work = at(/^## \d\. Do the work$/m);
+  assert.ok(merge < rules && rules < brief && brief < setup && setup < work);
+  assert.match(text.slice(setup, work), /If it fails, stop and report/);
+  assert.match(text.slice(setup, work), /Don't retry with other commands/);
+  assert.match(text, /^Setup: <command> -> <passed \| failed \| not set>$/m);
+});
+
+test("setup_command is optional, and an empty one is could-not-verify", () => {
+  const repo = adopted("core,delegate");
+  assert.doesNotMatch(readFileSync(join(repo, ".agent/policy.yml"), "utf8"), /^setup_command:/m);
+  assert.equal(kit(repo, "check").status, 0);
+  appendFileSync(join(repo, ".agent/policy.yml"), "setup_command: npm ci  # install exact deps\n");
+  const result = kit(repo, "check");
+  assert.equal(result.status, 0, result.out);
+  for (const empty of ["", "\"\""]) {
+    setPolicy(repo, "setup_command", empty);
+    const bad = kit(repo, "check");
+    assert.equal(bad.status, 2, bad.out);
+    assert.match(bad.out, /setup_command is empty/);
+  }
+});
+
+test("the verifier can't edit, spawn agents or pick its own model", () => {
+  const text = readFileSync(join(KIT_ROOT, "modules/delegate/files", VERIFIER), "utf8");
+  const frontmatter = text.split("---")[1];
+  assert.match(frontmatter, /^name: verifier$/m);
+  const tools = frontmatter.match(/^tools: (.+)$/m)[1].split(",").map((tool) => tool.trim());
+  assert.deepEqual(tools.sort(), ["Bash", "Glob", "Grep", "Read"]);
+  assert.doesNotMatch(frontmatter, /^(model|permissionMode|isolation|disallowedTools|mcpServers):/m);
+  assert.match(text, /could not verify/);
+  assert.match(text, /^Result: <pass \| fail \| could not verify>$/m);
 });
 
 function guard(repo, input, env = {}) {
@@ -772,6 +840,32 @@ test("without a readable policy the guard stops writes but not reads", () => {
   assert.match(result.err, /could not verify/);
   assert.equal(guard(repo, bash("npm test")).status, 2);
   assert.equal(guard(repo, { tool_name: "Read", tool_input: { file_path: join(repo, "README.md") } }).status, 0);
+});
+
+test("the guard keeps the verifier read-only and leaves other agents alone", () => {
+  const repo = guardedRepo();
+  appendFileSync(join(repo, ".agent/policy.yml"), "setup_command: npm ci\n");
+  const as = (agent_type, input) => guard(repo, { agent_type, ...input });
+  for (const input of [edit(join(repo, "src/app.ts")),
+    { tool_name: "Write", tool_input: { file_path: join(repo, "notes.md") } }]) {
+    const result = as("verifier", input);
+    assert.equal(result.status, 2);
+    assert.match(result.err, /verifier agent is read-only/);
+  }
+  for (const command of ["echo x > notes.md", "npm test >> out.log", "rm -rf src", "sed -i s/a/b/ src/a.ts",
+    "git commit -am x", "git -C . merge feature", "git checkout main", "git stash", "git reset --hard",
+    "ls | xargs rm", "find . -name '*.log' -delete", "touch x"]) {
+    assert.equal(as("verifier", bash(command)).status, 2, command);
+  }
+  for (const command of ["git diff main...HEAD", "git --no-pager log --oneline", "git status --porcelain",
+    "git diff --name-only main...HEAD", "git merge-base main HEAD", "npm test 2>&1", "node --test > /dev/null"]) {
+    assert.equal(as("verifier", bash(command)).status, 0, command);
+  }
+  assert.equal(as("verifier", { tool_name: "Read", tool_input: { file_path: join(repo, "README.md") } }).status, 0);
+  assert.equal(as("verifier", bash("npm run deploy:prod")).status, 2);
+  assert.equal(as("worker", edit(join(repo, "src/app.ts"))).status, 0);
+  assert.equal(as("worker", bash("git commit -am x")).status, 0);
+  assert.equal(guard(repo, edit(join(repo, "src/app.ts"))).status, 0);
 });
 
 test("KIT_GUARD=off lets a person override the guard", () => {
@@ -1087,4 +1181,16 @@ test("reassess can give a repo with no profile its first profile", () => {
   assert.equal(existsSync(join(repo, "docs/SECURITY.md")), true);
   const check = kit(repo, "check");
   assert.equal(check.status, 0, check.out);
+});
+
+test("every profile works with delegate, the verifier and setup_command", () => {
+  for (const profile of PROFILES) {
+    const repo = initRepo(profile, "--modules", "core,delegate");
+    assert.equal(existsSync(join(repo, VERIFIER)), true, profile);
+    assert.match(readFileSync(join(repo, "AGENTS.md"), "utf8"), /`verifier`/, profile);
+    appendFileSync(join(repo, ".agent/policy.yml"), "setup_command: npm ci\n");
+    const result = kit(repo, "check");
+    assert.equal(result.status, 0, `${profile}: ${result.out}`);
+    assert.match(readFileSync(join(repo, ".agent/policy.yml"), "utf8"), new RegExp(`^profile: ${profile}$`, "m"));
+  }
 });
