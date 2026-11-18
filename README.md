@@ -56,6 +56,7 @@ and run `sync` in the repo on a review branch.
 - commands listed in `never_run`, unless the command only reads, such as `cat` or `rg`
 - common shell writes to protected paths, such as `rm`, `mv`, `cp`, `tee`, `sed -i` and
   output redirects
+- process files that can expose secrets, such as `/proc/self/environ`
 
 It is a guardrail, not a sandbox. A script or interpreter started from Bash can still do
 things the hook can't see. To change a protected file through an agent, start that session
@@ -87,7 +88,13 @@ uv tool install --python 3.13 git+https://github.com/NVIDIA/skillspector.git
 
 Add `CLAUDE_CODE_OAUTH_TOKEN` to the repo's Actions secrets and install the Claude
 GitHub App. Without the secret, `agent-brief` skips with a warning instead of failing,
-and no review runs. Repos on GitHub Free can't enforce any of this on merge, so treat a
+and no review runs.
+
+`agent-brief` reviews with read-only access, then a separate job with no agent checks and
+publishes the result. Add the `claude-fix` label to a PR when you want the agent to push
+its allowed fixes. Add `claude-review` to review it again.
+
+Repos on GitHub Free can't enforce any of this on merge, so treat a
 failed check as your signal not to merge.
 
 ## Setup for the `delegate` module

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.0
+
+- `agent-brief` now separates reading from writing. The `review` job has read-only GitHub
+  access and no edit, push, comment, web or issue tools. A `publish` job with no agent
+  validates its structured result, then posts the brief, label and filed issues.
+- Fixes run only when someone adds the `claude-fix` label.
+- The workflow sets `--permission-mode default`, so its tool list is strict. The action's
+  default auto mode can allow tools outside that list after a safety review.
+- Managed workflows pin third-party actions to full commit SHAs.
+- `pr-triage` has `review` and `fix` modes and treats repository text as evidence, not
+  instructions.
+- The guard blocks `/proc/*/environ`, `cmdline` and `mem`.
+
 ## 1.5.0
 
 - New managed `.agent/guard.mjs` in `core`: a PreToolUse hook that enforces
