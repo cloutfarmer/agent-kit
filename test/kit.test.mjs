@@ -676,3 +676,81 @@ test("KIT_GUARD=off lets a person override the guard", () => {
   const repo = guardedRepo();
   assert.equal(guard(repo, edit(join(repo, "vercel.json")), { KIT_GUARD: "off" }).status, 0);
 });
+
+const GATE = join(KIT_ROOT, "modules/core/files/.agent/skill-gate.mjs");
+
+function skillGate(input, env = process.env) {
+  const result = spawnSync(process.execPath, [GATE], { input, encoding: "utf8", env });
+  assert.equal(result.status, 0, result.stderr);
+  if (!result.stdout.trim()) return null;
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  return output.hookSpecificOutput.additionalContext;
+}
+
+test("a fresh adopt registers the skill-gate hook, and removing it fails", () => {
+  const repo = adopted();
+  const path = join(repo, ".claude/settings.json");
+  const settings = readJson(path);
+  assert.match(JSON.stringify(settings.hooks.UserPromptSubmit), /\.agent\/skill-gate\.mjs/);
+  assert.equal(existsSync(join(repo, ".agent/skill-gate.mjs")), true);
+  assert.equal(kit(repo, "check").status, 0);
+  delete settings.hooks.UserPromptSubmit;
+  writeFileSync(path, JSON.stringify(settings));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /FAIL \.claude\/settings\.json: no UserPromptSubmit hook runs \.agent\/skill-gate\.mjs/);
+  assert.doesNotMatch(result.out, /no SessionStart hook/);
+});
+
+test("a missing Skill vetting section fails", () => {
+  const repo = adopted();
+  const path = join(repo, "AGENTS.md");
+  assert.match(readFileSync(path, "utf8"), /skillspector scan <path-or-git-url> --no-llm --format json/);
+  writeFileSync(path, readFileSync(path, "utf8").replace("## Skill vetting", "## Skills"));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /FAIL AGENTS\.md: missing section "## Skill vetting"/);
+});
+
+test("sync prints the Skill vetting section and hook, and leaves both files alone", () => {
+  const repo = adopted("core");
+  const agentsPath = join(repo, "AGENTS.md");
+  const settingsPath = join(repo, ".claude/settings.json");
+  const agents = readFileSync(agentsPath, "utf8").replace(/## Skill vetting[\s\S]*?(?=## )/, "");
+  writeFileSync(agentsPath, agents);
+  const settings = readJson(settingsPath);
+  delete settings.hooks.UserPromptSubmit;
+  const settingsText = JSON.stringify(settings, null, 2);
+  writeFileSync(settingsPath, settingsText);
+  git(repo, "add", "-A");
+  git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init");
+  git(repo, "checkout", "-q", "-b", "kit-sync");
+
+  const synced = kit(repo, "sync", "--write");
+  assert.equal(synced.status, 0, synced.out);
+  assert.match(synced.out, /NOTE AGENTS\.md: missing section "## Skill vetting"; left unchanged\. Add this section:\n## Skill vetting\n/);
+  assert.doesNotMatch(synced.out, /Add this section:\n## Skill vetting[\s\S]*## Session budget/);
+  assert.match(synced.out, /NOTE \.claude\/settings\.json: no UserPromptSubmit hook runs \.agent\/skill-gate\.mjs/);
+  assert.match(synced.out, /Add these hooks:\n[\s\S]*"UserPromptSubmit"/);
+  assert.equal(readFileSync(agentsPath, "utf8"), agents);
+  assert.equal(readFileSync(settingsPath, "utf8"), settingsText);
+  assert.equal(kit(repo, "check").status, 1);
+});
+
+test("the skill gate reminds on skill prompts only, and on unreadable input", () => {
+  const reminder = skillGate(JSON.stringify({ prompt: "please install this skill from github" }));
+  assert.match(reminder, /AGENTS\.md › Skill vetting/);
+  assert.match(reminder, /skillspector scan <path-or-git-url> --no-llm --format json/);
+  assert.match(skillGate(JSON.stringify({ prompt: "add the MCP server" })), /Skill vetting/);
+  assert.match(skillGate(JSON.stringify({ prompt: "look at this SKILL.md" })), /Skill vetting/);
+  assert.equal(skillGate(JSON.stringify({ prompt: "fix the login bug" })), null);
+  assert.match(skillGate("{not json"), /Skill vetting/);
+});
+
+test("the skill gate says a missing scanner means could not verify", () => {
+  const reminder = skillGate(JSON.stringify({ prompt: "add a plugin" }), { ...process.env, PATH: "" });
+  assert.match(reminder, /SkillSpector is not installed/);
+  assert.match(reminder, /uv tool install --python 3\.13 git\+https:\/\/github\.com\/NVIDIA\/skillspector\.git/);
+  assert.match(reminder, /could not verify/);
+});

@@ -27,7 +27,7 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 
 | Module | Adds |
 |---|---|
-| `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, and the `guard` policy hook |
+| `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, the `skill-gate` prompt hook, and the `guard` policy hook |
 | `review` | `ponytail-review`, run on request |
 | `triage` (needs `review`) | `pr-triage`, plus the `agent-brief` and `agent-tripwire` workflows |
 | `delegate` (optional, off by default) | The `worker` agent: the main agent plans and reviews, workers on a cheaper model do the edits |
@@ -37,7 +37,7 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 | Group | Examples | Rule |
 |---|---|---|
 | Managed | Files under `modules/*/files/` | Must match the kit exactly |
-| Required structure | Required docs, `AGENTS.md` sections, `CLAUDE.md`, the freshness and guard hooks in `.claude/settings.json`, and the `delegate` section and settings when that module is on | Must exist in the right shape |
+| Required structure | Required docs, `AGENTS.md` sections (including `Skill vetting`), `CLAUDE.md`, the freshness, skill-gate and guard hooks in `.claude/settings.json`, and the `delegate` section and settings when that module is on | Must exist in the right shape |
 | Project-owned | `.agent/policy.yml`, `.agent/lessons.md`, doc content, the repo's CI | Never overwritten |
 
 `.agent/policy.yml` holds each repo's differences, and `.agent/kit.lock` records its kit
@@ -60,6 +60,28 @@ and run `sync` in the repo on a review branch.
 It is a guardrail, not a sandbox. A script or interpreter started from Bash can still do
 things the hook can't see. To change a protected file through an agent, start that session
 with `KIT_GUARD=off claude`.
+
+## Skill vetting (core)
+
+Every repo must vet a skill, plugin or MCP server with
+[SkillSpector](https://github.com/NVIDIA/SkillSpector) before an agent adds it. The
+rule lives in the `## Skill vetting` section of `AGENTS.md`. The managed
+`.agent/skill-gate.mjs` hook adds a reminder to any prompt that mentions a skill,
+plugin or MCP server. It never blocks a prompt.
+
+- The agent runs a static scan first: `skillspector scan <target> --no-llm --format json`.
+  Nothing leaves the machine except dependency names, which go to OSV.dev.
+- SAFE: the agent proceeds. CAUTION: it reruns with
+  `SKILLSPECTOR_PROVIDER=claude_cli`, which sends the skill's files to Anthropic, and
+  lets you decide. DO_NOT_INSTALL: it doesn't add the skill.
+- If SkillSpector is missing, errors, or reports partial coverage, the result is
+  "could not verify" and the skill is not added.
+
+Each machine needs `uv` and Python 3.13:
+
+```bash
+uv tool install --python 3.13 git+https://github.com/NVIDIA/skillspector.git
+```
 
 ## Setup for the `triage` module
 
