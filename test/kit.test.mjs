@@ -158,19 +158,114 @@ test("a missing Session budget section fails", () => {
   assert.match(result.out, /missing section "## Session budget"/);
 });
 
-test("agent-brief skips every review step when the token is missing", () => {
-  const text = readFileSync(join(KIT_ROOT, "modules/triage/files/.github/workflows/agent-brief.yml"), "utf8");
-  const steps = text.split(/^      - /m).slice(1);
-  const tokenStep = steps.findIndex((step) => step.includes("id: token"));
-  assert.ok(tokenStep >= 0, "the token check step is missing");
-  assert.match(steps[tokenStep], /HAS_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN != '' \}\}/);
-  const later = steps.slice(tokenStep + 1);
-  assert.ok(later.length >= 3);
-  for (const step of later) {
-    assert.match(step, /^\s+if: .*steps\.token\.outputs\.present == 'true'/m, step.split("\n")[0]);
+const BRIEF_WORKFLOW = join(KIT_ROOT, "modules/triage/files/.github/workflows/agent-brief.yml");
+
+function briefJob(name) {
+  const text = readFileSync(BRIEF_WORKFLOW, "utf8");
+  const match = text.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  (?:#|[a-z]+:)|(?![\\s\\S]))`, "m"));
+  assert.ok(match, `job ${name} is missing`);
+  return match[1];
+}
+
+test("agent-brief skips the review when the token is missing", () => {
+  assert.match(briefJob("prepare"), /HAS_TOKEN: \$\{\{ secrets\.CLAUDE_CODE_OAUTH_TOKEN != '' \}\}/);
+  assert.match(briefJob("review"), /if: needs\.prepare\.outputs\.present == 'true'/);
+  assert.match(briefJob("publish"), /if: always\(\) && needs\.prepare\.outputs\.present == 'true'/);
+  assert.match(briefJob("fix"), /uses: anthropics[\s\S]*/);
+  assert.match(briefJob("fix"), /- id: claude\n\s+if: steps\.token\.outputs\.present == 'true'/);
+});
+
+test("the agent-brief review job can read but can't change anything", () => {
+  const job = briefJob("review");
+  assert.match(job, /permissions:\n\s+contents: read\n\s+pull-requests: read\n\s+outputs:/);
+  assert.doesNotMatch(job, /: write/);
+  assert.match(job, /persist-credentials: false/);
+  assert.match(job, /--permission-mode default/);
+  const allowed = job.match(/--allowedTools "([^"]+)"/)[1];
+  assert.doesNotMatch(allowed, /\b(Edit|Write|WebFetch|WebSearch)\b|gh |git (add|commit|push)/);
+  assert.match(job, /--disallowedTools "[^"]*Edit,Write[^"]*Read\(\/\/proc\/\*\*\)"/);
+});
+
+test("only the claude-fix label starts the job that can push", () => {
+  const job = briefJob("fix");
+  assert.match(job, /github\.event\.action == 'labeled' &&\n\s+github\.event\.label\.name == 'claude-fix'/);
+  assert.match(job, /Bash\(git push origin HEAD\)/);
+  assert.doesNotMatch(job, /Bash\(gh /);
+  for (const name of ["prepare", "review", "publish"]) assert.doesNotMatch(briefJob(name), /git push/);
+});
+
+test("managed workflows pin every action and keep PR text out of shell code", () => {
+  for (const path of ["core/files/.github/workflows/kit-check.yml",
+    "triage/files/.github/workflows/agent-brief.yml", "triage/files/.github/workflows/agent-tripwire.yml"]) {
+    const text = readFileSync(join(KIT_ROOT, "modules", path), "utf8");
+    for (const [, action] of text.matchAll(/uses: (\S+)/g)) assert.match(action, /@[0-9a-f]{40}$/, action);
+    for (const [, script] of text.matchAll(/^ +run: \|\n((?:(?: {10,}.*)?\n)+)/gm)) {
+      assert.doesNotMatch(script, /\$\{\{/);
+    }
   }
-  const verify = later.find((step) => step.startsWith("name: Verify the brief"));
-  assert.match(verify, /if: always\(\) && steps\.token\.outputs\.present == 'true'/);
+});
+
+function publish(brief, { result = "success", existing = "0" } = {}) {
+  const lines = readFileSync(BRIEF_WORKFLOW, "utf8").split("\n");
+  const start = lines.findIndex((line) => line.includes("name: Publish the brief"));
+  const run = lines.findIndex((line, index) => index > start && line.trim() === "run: |");
+  const script = [];
+  for (const line of lines.slice(run + 1)) {
+    if (line && !line.startsWith("          ")) break;
+    script.push(line.slice(10));
+  }
+  const dir = tempDir();
+  const log = join(dir, "gh.log");
+  writeFileSync(join(dir, "gh"), `#!/usr/bin/env bash
+echo "gh $*" >> "${log}"
+if [[ "$1 $2" == "issue list" ]]; then echo "${existing}"; fi
+if [[ "$1 $2" == "issue create" ]]; then echo "https://example.test/issues/9"; fi
+if [[ "$1 $2" == "pr comment" ]]; then cp brief.md "${join(dir, "posted.md")}"; fi
+if [[ "$1 $2" == "issue create" ]]; then cp issue.md "${join(dir, "issue-posted.md")}"; fi
+`, { mode: 0o755 });
+  const run_ = spawnSync("bash", ["-c", script.join("\n")], {
+    cwd: dir,
+    encoding: "utf8",
+    env: {
+      ...process.env, PATH: `${dir}:${process.env.PATH}`, PR: "7", HEAD_SHA: "abc123", REVIEW_RESULT: result,
+      BRIEF: typeof brief === "string" ? brief : JSON.stringify(brief),
+    },
+  });
+  const read = (name) => (existsSync(join(dir, name)) ? readFileSync(join(dir, name), "utf8") : "");
+  return { status: run_.status, out: run_.stdout + run_.stderr, gh: read("gh.log"), posted: read("posted.md"), issue: read("issue-posted.md") };
+}
+
+const hasJq = spawnSync("jq", ["--version"]).status === 0;
+const goodBrief = {
+  summary: "Adds login.", label: "agent/ready", recommendation: "Ship.", not_checked: "",
+  findings: [{ tier: 2, title: "Empty name", location: "src/a.ts:3", details: "Problem.", action: "file" }],
+};
+
+test("publish posts a checked brief, files a finding and sets one label", { skip: !hasJq }, () => {
+  const result = publish(goodBrief);
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.posted, /<!-- agent-brief -->[\s\S]*Reviewed SHA: abc123/);
+  assert.match(result.posted, /filed https:\/\/example\.test\/issues\/9/);
+  assert.match(result.issue, /Finding ID: agent-finding-[0-9a-f]{12}/);
+  assert.match(result.gh, /gh pr edit 7 --add-label agent\/ready/);
+  assert.doesNotMatch(publish(goodBrief, { existing: "1" }).gh, /issue create/);
+});
+
+test("publish neutralizes markup in the agent's text", { skip: !hasJq }, () => {
+  const result = publish({ ...goodBrief, summary: "<!-- agent-brief --> @alex ![x](https://evil.test/a)" });
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.posted, /&lt;!-- agent-brief -->/);
+  assert.doesNotMatch(result.posted, /@alex|!\[x\]/);
+});
+
+test("publish refuses a failed, malformed or credential-bearing result", { skip: !hasJq }, () => {
+  for (const [brief, options] of [[goodBrief, { result: "failure" }], ["", {}], ["{}", {}],
+    [{ ...goodBrief, label: "ship-it" }, {}], [{ ...goodBrief, summary: "sk-ant-secret" }, {}]]) {
+    const result = publish(brief, options);
+    assert.equal(result.status, 1, result.out);
+    assert.match(result.gh, /--add-label agent\/could-not-verify/);
+    assert.equal(result.posted, "");
+  }
 });
 
 test("CLAUDE.md with extra rules fails", () => {
@@ -660,6 +755,13 @@ test("the guard blocks never_run commands and shell writes to protected paths", 
     "git diff vercel.json", "echo ok > /dev/null", "cp a.txt b.txt"]) {
     assert.equal(guard(repo, bash(command)).status, 0, command);
   }
+});
+
+test("the guard blocks process files that can expose secrets", () => {
+  const repo = guardedRepo();
+  assert.equal(guard(repo, { tool_name: "Read", tool_input: { file_path: "/proc/self/environ" } }).status, 2);
+  assert.equal(guard(repo, bash("cat /proc/self/environ")).status, 2);
+  assert.equal(guard(repo, bash("cat /proc/cpuinfo")).status, 0);
 });
 
 test("without a readable policy the guard stops writes but not reads", () => {

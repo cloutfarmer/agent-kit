@@ -1,8 +1,9 @@
 name: agent-brief
 
-# Managed by agent-kit. Reviews each non-draft PR and leaves one brief and one
-# label. It never merges. Add the claude-review label to run it again.
-# Skips with a warning when CLAUDE_CODE_OAUTH_TOKEN is not set.
+# Managed by agent-kit. Reviews each non-draft PR and leaves one brief and one label.
+# The review job can read the repo but can't write to GitHub. A separate job with no
+# agent publishes its checked result. Fixes run only when a person adds claude-fix.
+# Nothing here merges. Skips with a warning when CLAUDE_CODE_OAUTH_TOKEN is not set.
 
 on:
   pull_request:
@@ -11,37 +12,29 @@ on:
       - "docs/**"
       - "**/*.md"
 
-# Events this workflow ignores get their own group, so the labels and fix
-# commits made by a running review can't cancel that review.
+permissions: {}
+
+# Events this workflow ignores get their own group, so labels and fix commits can't
+# cancel a running review.
 concurrency:
   group: agent-brief-${{ github.event.pull_request.number }}-${{ ((github.event.action == 'labeled' && github.event.label.name != 'claude-review') || github.actor == 'claude[bot]') && github.run_id || 'review' }}
   cancel-in-progress: true
 
 jobs:
-  brief:
+  prepare:
     if: >-
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'claude[bot]' &&
       (github.event.action != 'labeled' || github.event.label.name == 'claude-review')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 5
     permissions:
-      contents: write
-      pull-requests: write
       issues: write
-      id-token: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      PR: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      pull-requests: write
+    outputs:
+      present: ${{ steps.token.outputs.present }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
       # Secrets can't be read in a job-level if, so map the secret to a boolean here.
       # The value itself is never printed.
       - name: Check for the Claude token
@@ -61,22 +54,48 @@ jobs:
       - name: Reset brief labels
         if: steps.token.outputs.present == 'true'
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           gh label create agent/ready --force --color 0E8A16 --description "Agent found nothing blocking"
           gh label create human/design --force --color 5319E7 --description "Needs a design decision"
           gh label create human/sensitive --force --color B60205 --description "Touches a human-only path"
           gh label create agent/could-not-verify --force --color D93F0B --description "Review did not complete"
           gh label create claude-review --force --color BFD4F2 --description "Run the agent review again"
+          gh label create claude-fix --force --color 1D76DB --description "Let the agent push fixes to this PR"
           gh label create tier-2 --force --color FBCA04 --description "Minor bug filed by review"
           gh label create tier-3 --force --color C5DEF5 --description "Unreachable or non-bug filed by review"
           gh pr edit "$PR" --remove-label agent/ready --remove-label human/design \
             --remove-label human/sensitive --remove-label agent/could-not-verify --remove-label claude-review
 
-      - uses: anthropics/claude-code-action@v1
-        if: steps.token.outputs.present == 'true'
+  review:
+    needs: prepare
+    if: needs.prepare.outputs.present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      brief: ${{ steps.claude.outputs.structured_output }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: claude
+        uses: anthropics/claude-code-action@5a856893345e332afa621934082d8c660c26d689 # v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
           prompt: |
+            MODE: review
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
             BASE BRANCH: ${{ github.event.pull_request.base.ref }}
@@ -86,23 +105,186 @@ jobs:
           claude_args: |
             --model sonnet
             --max-turns 60
-            --allowedTools "Skill,Read,Glob,Grep,Edit,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin HEAD),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr edit:*),Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh issue comment:*)"
+            --permission-mode default
+            --allowedTools "Skill,Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*)"
+            --disallowedTools "Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent,Read(//proc/**)"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["summary","label","recommendation","not_checked","findings"],"properties":{"summary":{"type":"string"},"label":{"enum":["agent/ready","human/design","human/sensitive","agent/could-not-verify"]},"recommendation":{"type":"string"},"not_checked":{"type":"string"},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["tier","title","location","details","action"],"properties":{"tier":{"enum":[1,2,3]},"title":{"type":"string"},"location":{"type":"string"},"details":{"type":"string"},"action":{"enum":["fix","file","human"]}}}}}}'
 
-      # Only an exact, current brief with one label counts. Everything else,
-      # including an agent failure, is reported as could-not-verify. Only a
-      # missing token skips this step.
-      - name: Verify the brief
+  # No checkout and no agent: this job treats the review result as untrusted data.
+  publish:
+    needs: [prepare, review]
+    if: always() && needs.prepare.outputs.present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Publish the brief
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          BRIEF: ${{ needs.review.outputs.brief }}
+        run: |
+          set -euo pipefail
+          could_not_verify() {
+            gh pr edit "$PR" --remove-label agent/ready --remove-label human/design \
+              --remove-label human/sensitive --add-label agent/could-not-verify || true
+            echo "COULD NOT VERIFY $1"
+            exit 1
+          }
+          [[ "$REVIEW_RESULT" == "success" ]] || could_not_verify "the review job ended with $REVIEW_RESULT"
+          valid='(.summary | type == "string") and (.recommendation | type == "string")
+            and (.not_checked | type == "string")
+            and (.label | IN("agent/ready", "human/design", "human/sensitive", "agent/could-not-verify"))
+            and (.findings | type == "array")
+            and all(.findings[]; (.tier | IN(1, 2, 3)) and (.title | type == "string")
+              and (.location | type == "string") and (.details | type == "string")
+              and (.action | IN("fix", "file", "human")))'
+          jq -e "$valid" >/dev/null 2>&1 <<<"$BRIEF" || could_not_verify "the review result is missing or malformed"
+          if grep -Eq 'sk-ant-|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_' <<<"$BRIEF"; then
+            could_not_verify "the review result looks like it contains a credential"
+          fi
+          # Stops the text from hiding markup, loading remote images or pinging people.
+          BRIEF="$(jq -c 'walk(if type == "string" then gsub("<"; "&lt;") | gsub("@"; "@​") | gsub("!\\["; "[") else . end)' <<<"$BRIEF")"
+
+          rows=""
+          number=0
+          while IFS= read -r finding; do
+            number=$((number + 1))
+            tier="$(jq -r '.tier' <<<"$finding")"
+            action="$(jq -r '.action' <<<"$finding")"
+            title="$(jq -r '.title | gsub("[\r\n|]+"; " ")' <<<"$finding")"
+            location="$(jq -r '.location | gsub("[\r\n|`]+"; " ")' <<<"$finding")"
+            outcome="needs a person"
+            [[ "$action" == "fix" || "$tier" == "1" ]] && outcome="add claude-fix to fix"
+            if [[ "$action" == "file" && "$tier" != "1" ]]; then
+              id="agent-finding-$(printf '%s|%s' "$location" "$title" | sha256sum | cut -c1-12)"
+              if [[ "$(gh issue list --state open --search "$id in:body" --json number --jq length)" == "0" ]]; then
+                jq -r '.details' <<<"$finding" > issue.md
+                printf '\n\n`%s`\n\nFound in #%s\n\nFinding ID: %s\n' "$location" "$PR" "$id" >> issue.md
+                outcome="filed $(gh issue create --title "$title" --label "tier-$tier" --body-file issue.md)"
+              else
+                outcome="already filed"
+              fi
+            fi
+            rows+="| $number | T$tier | $title (\`$location\`) | $outcome |"$'\n'
+          done < <(jq -c '.findings[]' <<<"$BRIEF")
+
+          {
+            echo "<!-- agent-brief -->"
+            echo "## Agent brief"
+            echo
+            echo "Reviewed SHA: $HEAD_SHA"
+            echo
+            echo "What this change does: $(jq -r '.summary' <<<"$BRIEF")"
+            echo
+            if [[ -n "$rows" ]]; then
+              echo "| # | Tier | Finding | Action |"
+              echo "|---|------|---------|--------|"
+              printf '%s\n' "$rows"
+            fi
+            echo "Recommendation: $(jq -r '.recommendation' <<<"$BRIEF")"
+            not_checked="$(jq -r '.not_checked' <<<"$BRIEF")"
+            [[ -z "$not_checked" ]] || echo "Not checked: $not_checked"
+          } > brief.md
+          gh pr comment "$PR" --edit-last --create-if-none --body-file brief.md
+          gh pr edit "$PR" --add-label "$(jq -r '.label' <<<"$BRIEF")"
+          echo "PASS brief recorded for $HEAD_SHA"
+
+  # Runs only when someone with triage access adds the claude-fix label.
+  fix:
+    if: >-
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'claude-fix' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'claude[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Check for the Claude token
+        id: token
+        shell: bash
+        env:
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [[ "$HAS_TOKEN" == "true" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=agent-brief fix skipped::CLAUDE_CODE_OAUTH_TOKEN is not set."
+          fi
+
+      - name: Clear the request label
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR" --remove-label claude-fix
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Uses the Claude GitHub App token, so a pushed fix still starts the repo's CI.
+      - id: claude
+        if: steps.token.outputs.present == 'true'
+        uses: anthropics/claude-code-action@5a856893345e332afa621934082d8c660c26d689 # v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            MODE: fix
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            BASE BRANCH: ${{ github.event.pull_request.base.ref }}
+            REVIEWED SHA: ${{ github.event.pull_request.head.sha }}
+
+            Run the pr-triage skill on this pull request.
+          claude_args: |
+            --model sonnet
+            --max-turns 60
+            --permission-mode default
+            --allowedTools "Skill,Read,Glob,Grep,Edit,Write,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin HEAD)"
+            --disallowedTools "WebFetch,WebSearch,Agent,Read(//proc/**)"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["commit","summary"],"properties":{"commit":{"type":"string"},"summary":{"type":"string"}}}'
+
+      - name: Report the fix
         if: always() && steps.token.outputs.present == 'true'
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RESULT: ${{ steps.claude.outputs.structured_output }}
         run: |
-          view="$(gh pr view "$PR" --json labels,comments)"
-          labels="$(jq -r '[.labels[].name | select(. == "agent/ready" or . == "human/design" or . == "human/sensitive" or . == "agent/could-not-verify")] | length' <<<"$view")"
-          brief="$(jq --arg sha "Reviewed SHA: $HEAD_SHA" '[.comments[].body | select(contains("<!-- agent-brief -->") and contains($sha))] | length' <<<"$view")"
-          if [[ "$labels" == "1" && "$brief" -ge 1 ]]; then
-            echo "PASS brief recorded for $HEAD_SHA"
-            exit 0
+          set -euo pipefail
+          if ! jq -e '(.commit | type == "string") and (.summary | type == "string")' >/dev/null 2>&1 <<<"$RESULT" \
+            || grep -Eq 'sk-ant-|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_' <<<"$RESULT"; then
+            gh pr comment "$PR" --body "Agent fix: could not verify the result. Check the workflow run."
+            exit 1
           fi
-          gh pr edit "$PR" --remove-label agent/ready --remove-label human/design \
-            --remove-label human/sensitive --add-label agent/could-not-verify
-          echo "COULD NOT VERIFY labels=$labels matching_briefs=$brief"
-          exit 1
+          commit="$(jq -r '.commit' <<<"$RESULT")"
+          head="$(gh pr view "$PR" --json headRefOid --jq .headRefOid)"
+          if [[ "$commit" != "none" && ! "$commit" =~ ^[0-9a-f]{7,40}$ ]] || [[ "$commit" != "none" && "$head" != "$commit"* ]]; then
+            gh pr comment "$PR" --body "Agent fix: could not verify that the reported commit is on this PR."
+            exit 1
+          fi
+          jq -r '"Agent fix: " + (.summary | gsub("<"; "&lt;") | gsub("@"; "@​") | gsub("!\\["; "["))' <<<"$RESULT" > fix.md
+          printf '\nCommit: %s\n\nAdd `claude-review` for a fresh review.\n' "$commit" >> fix.md
+          gh pr comment "$PR" --body-file fix.md

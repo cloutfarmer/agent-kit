@@ -28,6 +28,11 @@ function isSecretEnvFile(path) {
   return name === ".env" || name.startsWith(".env.");
 }
 
+// These files can expose a running process's secrets.
+function isProcessSecret(path) {
+  return /^\/proc\/[^/]+\/(cmdline|environ|mem)$/.test(path);
+}
+
 function parseList(text, key) {
   const lines = text.split(/\r?\n/);
   const start = lines.findIndex((line) => line.startsWith(`${key}:`));
@@ -93,7 +98,10 @@ function checkEdit(path, cwd, projectDir) {
 }
 
 function checkRead(path, cwd) {
-  if (path && isSecretEnvFile(resolve(cwd, path))) throw new Blocked(`${path} is an environment file`);
+  if (!path) return;
+  const full = resolve(cwd, path);
+  if (isSecretEnvFile(full)) throw new Blocked(`${path} is an environment file`);
+  if (isProcessSecret(full)) throw new Blocked(`${path} can expose process secrets`);
 }
 
 function words(segment) {
@@ -139,6 +147,7 @@ function checkBash(command, startDir, projectDir) {
     if (list[0] === "cd" && list[1]) cwd = resolve(cwd, list[1]);
     for (const word of fileWords(segment, list)) {
       if (isSecretEnvFile(word)) throw new Blocked(`the command touches ${word}, an environment file`);
+      if (isProcessSecret(word)) throw new Blocked(`the command touches ${word}, which can expose process secrets`);
     }
     if (!isReadOnly(list)) {
       const entry = policy.neverRun.find((item) => neverRunMatch(segment, item));
