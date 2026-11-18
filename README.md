@@ -27,7 +27,7 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 
 | Module | Adds |
 |---|---|
-| `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, and the `skill-gate` prompt hook |
+| `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, the `skill-gate` prompt hook, and the `guard` policy hook |
 | `review` | `ponytail-review`, run on request |
 | `triage` (needs `review`) | `pr-triage`, plus the `agent-brief` and `agent-tripwire` workflows |
 | `delegate` (optional, off by default) | The `worker` agent: the main agent plans and reviews, workers on a cheaper model do the edits |
@@ -37,13 +37,29 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 | Group | Examples | Rule |
 |---|---|---|
 | Managed | Files under `modules/*/files/` | Must match the kit exactly |
-| Required structure | Required docs, `AGENTS.md` sections (including `Skill vetting`), `CLAUDE.md`, the freshness and skill-gate hooks in `.claude/settings.json`, and the `delegate` section and settings when that module is on | Must exist in the right shape |
+| Required structure | Required docs, `AGENTS.md` sections (including `Skill vetting`), `CLAUDE.md`, the freshness, skill-gate and guard hooks in `.claude/settings.json`, and the `delegate` section and settings when that module is on | Must exist in the right shape |
 | Project-owned | `.agent/policy.yml`, `.agent/lessons.md`, doc content, the repo's CI | Never overwritten |
 
 `.agent/policy.yml` holds each repo's differences, and `.agent/kit.lock` records its kit
 version and file hashes. Skills the kit doesn't provide are project-owned, and `check`
 ignores them. To change a managed file, change the kit, release a version,
 and run `sync` in the repo on a review branch.
+
+## What the guard enforces
+
+`.agent/guard.mjs` runs before Claude Code uses a file tool or Bash. It blocks:
+
+- edits to `human_only_paths`, `.agent/guard.mjs`, `.agent/policy.yml` and
+  `.claude/settings*.json`
+- reads, edits and shell commands that touch `.env` files, except `.env.example`,
+  `.env.sample` and `.env.template`
+- commands listed in `never_run`, unless the command only reads, such as `cat` or `rg`
+- common shell writes to protected paths, such as `rm`, `mv`, `cp`, `tee`, `sed -i` and
+  output redirects
+
+It is a guardrail, not a sandbox. A script or interpreter started from Bash can still do
+things the hook can't see. To change a protected file through an agent, start that session
+with `KIT_GUARD=off claude`.
 
 ## Skill vetting (core)
 

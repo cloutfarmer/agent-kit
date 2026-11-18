@@ -577,6 +577,106 @@ test("the worker is isolated, can't spawn agents, and leaves the model to settin
   assert.match(text, /Never push/);
 });
 
+function guard(repo, input, env = {}) {
+  const result = spawnSync("node", [join(repo, ".agent/guard.mjs")], {
+    input: JSON.stringify({ cwd: repo, ...input }),
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_PROJECT_DIR: repo, KIT_GUARD: "", ...env },
+  });
+  return { status: result.status, err: result.stderr };
+}
+
+const edit = (file_path) => ({ tool_name: "Edit", tool_input: { file_path } });
+const bash = (command) => ({ tool_name: "Bash", tool_input: { command } });
+
+function guardedRepo() {
+  const repo = adopted("core");
+  setPolicy(repo, "human_only_paths", "[.github/workflows/**, db/migrations/**, vercel.json]");
+  setPolicy(repo, "never_run", "[npm run deploy:prod, tests/storage.spec.ts]");
+  return repo;
+}
+
+test("a fresh adopt registers the guard, and removing it fails", () => {
+  const repo = adopted("core");
+  const path = join(repo, ".claude/settings.json");
+  const settings = JSON.parse(readFileSync(path, "utf8"));
+  assert.match(JSON.stringify(settings.hooks.PreToolUse), /\.agent\/guard\.mjs/);
+  delete settings.hooks.PreToolUse;
+  writeFileSync(path, JSON.stringify(settings));
+  const result = kit(repo, "check");
+  assert.equal(result.status, 1);
+  assert.match(result.out, /no PreToolUse hook runs \.agent\/guard\.mjs/);
+});
+
+test("the guard blocks human-only paths and always protects its own rules", () => {
+  const repo = guardedRepo();
+  for (const path of [".github/workflows/ci.yml", "db/migrations/001.sql", "vercel.json",
+    ".agent/policy.yml", ".agent/guard.mjs", ".claude/settings.json", ".claude/settings.local.json"]) {
+    const result = guard(repo, edit(join(repo, path)));
+    assert.equal(result.status, 2, path);
+    assert.match(result.err, /guard blocked/);
+  }
+  assert.equal(guard(repo, edit(join(repo, "src/app.ts"))).status, 0);
+  assert.equal(guard(repo, edit(join(repo, "docs/vercel.json"))).status, 0);
+});
+
+test("the guard judges a worktree by its own paths", () => {
+  const repo = guardedRepo();
+  setPolicy(repo, "human_only_paths", "[.claude/**, db/**]");
+  git(repo, "add", "-A");
+  git(repo, "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-qm", "kit");
+  const tree = join(repo, ".claude/worktrees/w1");
+  git(repo, "worktree", "add", "-q", tree, "-b", "w1");
+  const input = (path) => ({ cwd: tree, ...edit(join(tree, path)) });
+  assert.equal(guard(repo, input("src/new/file.ts")).status, 0);
+  assert.equal(guard(repo, input("db/schema.sql")).status, 2);
+  assert.equal(guard(repo, input(".claude/settings.json")).status, 2);
+});
+
+test("the guard keeps agents out of env files but allows the examples", () => {
+  const repo = guardedRepo();
+  assert.equal(guard(repo, { tool_name: "Read", tool_input: { file_path: join(repo, ".env.local") } }).status, 2);
+  assert.equal(guard(repo, { tool_name: "Grep", tool_input: { path: ".env" } }).status, 2);
+  assert.equal(guard(repo, edit(join(repo, "app/.env"))).status, 2);
+  for (const command of ["cat .env", "source ./.env.local", "node --env-file=.env x.js", "cat < .env"]) {
+    assert.equal(guard(repo, bash(command)).status, 2, command);
+  }
+  assert.equal(guard(repo, { tool_name: "Read", tool_input: { file_path: join(repo, ".env.example") } }).status, 0);
+  assert.equal(guard(repo, bash("cat .env.example")).status, 0);
+  assert.equal(guard(repo, bash("node -p process.env.HOME")).status, 0);
+  assert.equal(guard(repo, bash("git commit -m 'document .env setup'")).status, 0);
+  assert.equal(guard(repo, bash("rg .env src")).status, 0);
+  assert.equal(guard(repo, bash("grep KEY .env")).status, 2);
+});
+
+test("the guard blocks never_run commands and shell writes to protected paths", () => {
+  const repo = guardedRepo();
+  for (const command of ["npm test && npm  run deploy:prod", "npx playwright test tests/storage.spec.ts",
+    "rm -f vercel.json", "echo x > .github/workflows/ci.yml", "sed -i s/a/b/ db/migrations/1.sql",
+    "git checkout -- vercel.json", "echo x | tee .agent/policy.yml", "cd .github/workflows && rm ci.yml"]) {
+    assert.equal(guard(repo, bash(command)).status, 2, command);
+  }
+  for (const command of ["npm test", "cat tests/storage.spec.ts", "rg deploy:prod package.json",
+    "git diff vercel.json", "echo ok > /dev/null", "cp a.txt b.txt"]) {
+    assert.equal(guard(repo, bash(command)).status, 0, command);
+  }
+});
+
+test("without a readable policy the guard stops writes but not reads", () => {
+  const repo = guardedRepo();
+  rmSync(join(repo, ".agent/policy.yml"));
+  const result = guard(repo, edit(join(repo, "src/app.ts")));
+  assert.equal(result.status, 2);
+  assert.match(result.err, /could not verify/);
+  assert.equal(guard(repo, bash("npm test")).status, 2);
+  assert.equal(guard(repo, { tool_name: "Read", tool_input: { file_path: join(repo, "README.md") } }).status, 0);
+});
+
+test("KIT_GUARD=off lets a person override the guard", () => {
+  const repo = guardedRepo();
+  assert.equal(guard(repo, edit(join(repo, "vercel.json")), { KIT_GUARD: "off" }).status, 0);
+});
+
 const GATE = join(KIT_ROOT, "modules/core/files/.agent/skill-gate.mjs");
 
 function skillGate(input, env = process.env) {

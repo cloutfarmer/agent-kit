@@ -44,6 +44,7 @@ const SETTINGS_PATH = ".claude/settings.json";
 const REQUIRED_HOOKS = [
   { event: "SessionStart", script: ".agent/freshness.mjs" },
   { event: "UserPromptSubmit", script: ".agent/skill-gate.mjs" },
+  { event: "PreToolUse", script: ".agent/guard.mjs" },
 ];
 const DELEGATE_SECTION = "Delegation";
 const SUBAGENT_MODEL = "CLAUDE_CODE_SUBAGENT_MODEL";
