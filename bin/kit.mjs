@@ -35,6 +35,8 @@ const DOCS_ROOT_ALLOWED = new Set([
 const IGNORED_NAMES = new Set([".DS_Store"]);
 const LIST_KEYS = ["modules", "human_only_paths", "design_triggers", "never_run", "allowed_extra_docs"];
 const SCALAR_KEYS = ["base_branch", "ci_job", "scan_command"];
+// Settings a policy may leave out. A policy written before they existed stays valid.
+const OPTIONAL_SCALAR_KEYS = ["setup_command"];
 const TEMPLATE_FILES = [
   "AGENTS.md", "CLAUDE.md", "README.md", "ARCHITECTURE.md",
   "docs/README.md", "docs/STATUS.md", "docs/TESTING.md", ".agent/lessons.md",
@@ -105,13 +107,26 @@ function hasSection(text, section) {
   return new RegExp(`^## ${section}\\s*$`, "m").test(text);
 }
 
+// Returns the body of "## <section>" up to the next "## " heading.
+function sectionText(text, section) {
+  const start = text.search(new RegExp(`^## ${section}\\s*$`, "m"));
+  const rest = text.slice(start).split("\n").slice(1).join("\n");
+  const next = rest.search(/^## /m);
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
 // Returns what the delegate module still needs in AGENTS.md and .claude/settings.json.
 // A missing or unreadable file is reported by the general checks, not here.
 function delegateProblems(repo) {
   const problems = [];
   const agentsPath = join(repo, "AGENTS.md");
-  if (existsSync(agentsPath) && !hasSection(readFileSync(agentsPath, "utf8"), DELEGATE_SECTION)) {
-    problems.push({ path: "AGENTS.md", text: `AGENTS.md: module delegate needs section "## ${DELEGATE_SECTION}"` });
+  if (existsSync(agentsPath)) {
+    const agents = readFileSync(agentsPath, "utf8");
+    if (!hasSection(agents, DELEGATE_SECTION)) {
+      problems.push({ path: "AGENTS.md", text: `AGENTS.md: module delegate needs section "## ${DELEGATE_SECTION}"` });
+    } else if (!/`verifier`/.test(sectionText(agents, DELEGATE_SECTION))) {
+      problems.push({ path: "AGENTS.md", text: `AGENTS.md: section "## ${DELEGATE_SECTION}" must tell the main agent when to run \`verifier\`` });
+    }
   }
   let settings = null;
   try {
@@ -201,7 +216,10 @@ export function parsePolicy(text) {
     const [, key, rawValue] = pair;
     const value = rawValue.replace(/\s+#.*$/, "");
     openList = null;
-    if (!LIST_KEYS.includes(key) && !SCALAR_KEYS.includes(key)) {
+    if (OPTIONAL_SCALAR_KEYS.includes(key) && !parseScalar(value)) {
+      throw new CouldNotVerify(`${POLICY_PATH} setting ${key} is empty; give a command or remove the line`);
+    }
+    if (!LIST_KEYS.includes(key) && !SCALAR_KEYS.includes(key) && !OPTIONAL_SCALAR_KEYS.includes(key)) {
       throw new CouldNotVerify(`${POLICY_PATH} has an unknown setting: ${key}`);
     }
     if (LIST_KEYS.includes(key)) {

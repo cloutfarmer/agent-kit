@@ -7,3 +7,5 @@ human_only_paths: [.env*, .github/workflows/**, .agent/policy.yml, .claude/setti
 design_triggers: [new dependency, schema change, breaking public API change, auth change]
 never_run: []
 allowed_extra_docs: []
+# Optional. Workers run this in their worktree before editing, for example npm ci.
+# setup_command: npm ci

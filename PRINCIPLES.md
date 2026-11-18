@@ -21,7 +21,8 @@ dossiers, and a persistent fleet of sessions.
 Added beyond the source: the optional `delegate` module. The main agent plans and
 reviews on the strongest model, and `worker` agents do the edits on the cheaper model
 forced in `.claude/settings.json`. A worker lasts for one brief, so this is not a
-persistent fleet.
+persistent fleet. A read-only `verifier` rechecks the combined diff, and any risky or
+failed brief, and reports only problems it can back with evidence.
 
 Also added: skill vetting in `core`. Third-party skills, plugins and MCP servers are
 scanned with SkillSpector before an agent adds them. A missing scanner or partial

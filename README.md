@@ -30,7 +30,7 @@ Other `adopt` options: `--base-branch`, `--ci-job`, `--scan-command`, and
 | `core` (required) | `kit-check` workflow, repository scan, the `freshness` session-start hook, the `skill-gate` prompt hook, and the `guard` policy hook |
 | `review` | `ponytail-review`, run on request |
 | `triage` (needs `review`) | `pr-triage`, plus the `agent-brief` and `agent-tripwire` workflows |
-| `delegate` (optional, off by default) | The `worker` agent: the main agent plans and reviews, workers on a cheaper model do the edits |
+| `delegate` (optional, off by default) | The `worker` and `verifier` agents: the main agent plans and reviews, workers on a cheaper model do the edits, and a read-only verifier checks them |
 
 ## How repos stay matched
 
@@ -57,6 +57,10 @@ and run `sync` in the repo on a review branch.
 - common shell writes to protected paths, such as `rm`, `mv`, `cp`, `tee`, `sed -i` and
   output redirects
 - process files that can expose secrets, such as `/proc/self/environ`
+
+When the delegate module's `verifier` agent is running, the guard also blocks every
+file edit tool and any shell command that writes files, commits, merges or switches
+branches. Claude Code tells the hook which agent is calling through `agent_type`.
 
 It is a guardrail, not a sandbox. A script or interpreter started from Bash can still do
 things the hook can't see. To change a protected file through an agent, start that session
@@ -100,17 +104,34 @@ failed check as your signal not to merge.
 ## Setup for the `delegate` module
 
 Add `delegate` to `modules` in `.agent/policy.yml`, then run `sync` on a review branch.
-`sync` installs `.claude/agents/worker.md` and prints two things to add by hand, because
-the kit never edits project-owned files:
+`sync` installs `.claude/agents/worker.md` and `.claude/agents/verifier.md`, and prints
+two things to add by hand, because the kit never edits project-owned files:
 
 - A `## Delegation` section in `AGENTS.md`. It tells the main agent to write its plan
-  as briefs and send them to workers.
+  as briefs, send them to workers, and run the verifier. `check` fails until the section
+  names `verifier`.
 - Two keys under `env` in `.claude/settings.json`:
   `CLAUDE_CODE_SUBAGENT_MODEL` (the worker model, `sonnet` by default) and
   `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` set to `"1"`. Together they put every subagent on
-  that model, whatever the main session runs on. This needs Claude Code 2.1.251 or
-  later. `worker.md` has no `model` line, so the settings file is the only place the
-  model is set.
+  that model, whatever the main session runs on. This needs Claude Code 2.1.257 or
+  later. The agent files have no `model` line, so the settings file is the only place
+  the model is set.
+
+| Agent | What it does | Limits |
+|---|---|---|
+| `worker` | Carries out one brief in its own git worktree, then commits there | Can't start other agents. The guard still applies |
+| `verifier` | Checks a diff against its briefs and owned paths, reruns the done-check, and reports only problems it can back with evidence | Only `Read`, `Grep`, `Glob` and `Bash`. The guard blocks shell writes while it runs |
+
+The worker merges the task branch first, then reads `AGENTS.md` and `.agent/policy.yml`,
+so it follows the rules on that branch. If the policy sets `setup_command`, such as
+`npm ci`, the worker runs it in its worktree before editing, and stops if it fails.
+The setting is optional.
+
+The verifier runs on the same forced model as the workers. With
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on, Claude Code ignores the `model` line in every
+agent file, so no single agent can use a stronger model. The kit keeps the setting on,
+so the verifier is a second check on the cheaper model, not a stronger reviewer. The
+main agent still reads every diff itself.
 
 Run the main session on your strongest model. To cut permission prompts, allow the
 repo's own test, lint and build commands under `permissions.allow` in
