@@ -856,3 +856,235 @@ test("the skill gate says a missing scanner means could not verify", () => {
   assert.match(reminder, /uv tool install --python 3\.13 git\+https:\/\/github\.com\/NVIDIA\/skillspector\.git/);
   assert.match(reminder, /could not verify/);
 });
+
+const { PROFILES, recommend } = await import(KIT);
+
+const ANSWERS = {
+  sandbox: { goal: "learning", users: "only-me", public: "no", deployed: "no", data: "none", services: "none", recovery: "easy" },
+  personal: { goal: "personal-tool", users: "only-me", public: "no", deployed: "yes", data: "personal", services: "paid", recovery: "moderate" },
+  public: { goal: "showcase", users: "anyone", public: "yes", deployed: "yes", data: "none", services: "none", recovery: "easy" },
+  product: { goal: "product", users: "anyone", public: "yes", deployed: "yes", data: "others", services: "payments", recovery: "hard" },
+};
+
+function answerFlags(answers) {
+  return Object.entries(answers).flatMap(([key, value]) => [`--${key}`, value]);
+}
+
+function initRepo(profile, ...extra) {
+  const repo = tempDir();
+  git(repo, "init", "-q", "-b", "main");
+  const result = kit(repo, "init", ...answerFlags(ANSWERS[profile]), ...extra, "--write");
+  assert.equal(result.status, 0, result.out);
+  return repo;
+}
+
+function repoFiles(repo) {
+  return git(repo, "ls-files", "--others").split("\n").filter(Boolean).sort();
+}
+
+test("the riskiest answer decides the recommended profile", () => {
+  for (const profile of PROFILES) assert.equal(recommend(ANSWERS[profile]).profile, profile);
+  const quiet = ANSWERS.sandbox;
+  assert.equal(recommend({ ...quiet, data: "others" }).profile, "product");
+  assert.equal(recommend({ ...quiet, services: "payments" }).profile, "product");
+  assert.equal(recommend({ ...quiet, public: "yes", data: "others" }).profile, "product");
+  assert.equal(recommend({ ...quiet, public: "yes" }).profile, "public");
+  assert.equal(recommend({ ...quiet, deployed: "yes", users: "anyone" }).profile, "public");
+  assert.equal(recommend({ ...quiet, deployed: "yes" }).profile, "personal");
+  assert.equal(recommend({ ...quiet, data: "personal" }).profile, "personal");
+  assert.equal(recommend({ ...quiet, recovery: "hard" }).profile, "personal");
+  assert.deepEqual(recommend({ ...quiet, public: "yes", deployed: "yes" }).reasons, ["the repository is public"]);
+});
+
+test("init previews until --write, then records the profile and its reason", () => {
+  const repo = tempDir();
+  git(repo, "init", "-q", "-b", "main");
+  const dry = kit(repo, "init", ...answerFlags(ANSWERS.personal));
+  assert.equal(dry.status, 0, dry.out);
+  assert.match(dry.out, /RECOMMEND personal, because something is deployed; it holds real personal data/);
+  assert.match(dry.out, /DRY RUN/);
+  assert.deepEqual(repoFiles(repo), []);
+  assert.equal(kit(repo, "init", ...answerFlags(ANSWERS.personal), "--write").status, 0);
+  const policy = readFileSync(join(repo, ".agent/policy.yml"), "utf8");
+  assert.match(policy, /^profile: personal$/m);
+  assert.match(policy, /^profile_reason: "recommended: something is deployed; it holds real personal data; it uses paid services"$/m);
+  assert.match(kit(repo, "init", ...answerFlags(ANSWERS.personal)).out, /already exists\. Run kit init --reassess/);
+});
+
+test("init without a terminal needs every answer as a flag", () => {
+  const repo = tempDir();
+  const result = kit(repo, "init", "--goal", "learning");
+  assert.equal(result.status, 2, result.out);
+  assert.match(result.out, /no terminal to ask[\s\S]*--users only-me\|invited\|anyone/);
+  const bad = kit(repo, "init", ...answerFlags({ ...ANSWERS.sandbox, public: "maybe" }));
+  assert.equal(bad.status, 2, bad.out);
+  assert.equal(existsSync(join(repo, ".agent")), false);
+});
+
+test("a lighter profile needs --reason, and the reason is recorded", () => {
+  const repo = tempDir();
+  git(repo, "init", "-q", "-b", "main");
+  const flags = answerFlags(ANSWERS.public);
+  const refused = kit(repo, "init", ...flags, "--profile", "sandbox", "--write");
+  assert.equal(refused.status, 1, refused.out);
+  assert.match(refused.out, /lighter than the recommended public\. Add --reason/);
+  assert.deepEqual(repoFiles(repo), []);
+  assert.equal(kit(repo, "init", ...flags, "--profile", "enterprise").status, 2);
+  assert.equal(kit(repo, "init", ...flags, "--reason", "no profile given").status, 2);
+
+  const result = kit(repo, "init", ...flags, "--profile", "personal", "--reason", "static page # no secrets", "--write");
+  assert.equal(result.status, 0, result.out);
+  const policy = readFileSync(join(repo, ".agent/policy.yml"), "utf8");
+  assert.match(policy, /^profile_reason: "lighter than recommended public: static page # no secrets"$/m);
+  assert.equal(existsSync(join(repo, "ARCHITECTURE.md")), false);
+  assert.equal(kit(repo, "check").status, 0);
+
+  const stricter = initRepo("sandbox", "--profile", "product");
+  assert.match(readFileSync(join(stricter, ".agent/policy.yml"), "utf8"), /^profile: product$/m);
+});
+
+const CORE_ALWAYS = [".agent/guard.mjs", ".agent/kit.lock", ".agent/lessons.md", ".agent/policy.yml",
+  ".agent/skill-gate.mjs", ".claude/settings.json", "AGENTS.md", "CLAUDE.md", "README.md"];
+const PROFILE_ADDS = {
+  sandbox: [],
+  personal: [".agent/freshness.mjs", ".agent/repository-scan.mjs", ".github/workflows/ci.yml",
+    "docs/README.md", "docs/STATUS.md", "docs/TESTING.md"],
+  public: ["ARCHITECTURE.md", "docs/operations/deploy.md", ".github/workflows/kit-check.yml"],
+  product: ["docs/SECURITY.md", "docs/PRIVACY.md", "docs/operations/rollback.md"],
+};
+
+test("each profile's adopt creates only what it needs, and passes check", () => {
+  let expected = [...CORE_ALWAYS];
+  for (const profile of PROFILES) {
+    expected = [...expected, ...PROFILE_ADDS[profile]];
+    const repo = initRepo(profile, "--modules", "core");
+    assert.deepEqual(repoFiles(repo), [...expected].sort(), profile);
+    const result = kit(repo, "check");
+    assert.equal(result.status, 0, result.out);
+    const hooks = JSON.stringify(readJson(join(repo, ".claude/settings.json")).hooks);
+    assert.match(hooks, /\.agent\/guard\.mjs/);
+    assert.match(hooks, /\.agent\/skill-gate\.mjs/);
+    assert.equal(hooks.includes("freshness.mjs"), profile !== "sandbox", profile);
+    const agents = readFileSync(join(repo, "AGENTS.md"), "utf8");
+    for (const section of ["Repository", "Safety rules", "Skill vetting"]) assert.match(agents, new RegExp(`^## ${section}$`, "m"));
+    for (const [, path] of agents.matchAll(/`((?:docs\/)?[A-Za-z/.]+\.md)`/g)) {
+      if (path !== "docs/history/") assert.ok(existsSync(join(repo, path)), `${profile} AGENTS.md points at missing ${path}`);
+    }
+  }
+});
+
+test("profiles default to fewer modules", () => {
+  assert.equal(existsSync(join(initRepo("sandbox"), SKILL)), false);
+  const personal = initRepo("personal");
+  assert.equal(existsSync(join(personal, SKILL)), true);
+  assert.equal(existsSync(join(personal, ".github/workflows/agent-brief.yml")), false);
+  assert.equal(existsSync(join(initRepo("public"), ".github/workflows/agent-brief.yml")), true);
+});
+
+test("each profile's check fails on what that profile requires", () => {
+  const cases = [
+    ["sandbox", "AGENTS.md", "## Skill vetting", "## Skills", /missing section "## Skill vetting"/],
+    ["personal", "docs/STATUS.md", null, null, /docs\/STATUS\.md: required file is missing/],
+    ["personal", ".github/workflows/ci.yml", null, null, /no project workflow has the job "ci"/],
+    ["public", "docs/operations/deploy.md", null, null, /deploy\.md: required file is missing/],
+    ["public", ".github/workflows/kit-check.yml", null, null, /kit-check\.yml: managed file is missing/],
+    ["product", "docs/PRIVACY.md", null, null, /docs\/PRIVACY\.md: required file is missing/],
+  ];
+  for (const [profile, path, from, to, failure] of cases) {
+    const repo = initRepo(profile, "--modules", "core");
+    if (from) writeFileSync(join(repo, path), readFileSync(join(repo, path), "utf8").replace(from, to));
+    else rmSync(join(repo, path));
+    const result = kit(repo, "check");
+    assert.equal(result.status, 1, `${profile} ${path}: ${result.out}`);
+    assert.match(result.out, failure);
+  }
+  const sandbox = initRepo("sandbox");
+  const settings = readJson(join(sandbox, ".claude/settings.json"));
+  delete settings.hooks.PreToolUse;
+  writeFileSync(join(sandbox, ".claude/settings.json"), JSON.stringify(settings));
+  assert.match(kit(sandbox, "check").out, /no PreToolUse hook runs \.agent\/guard\.mjs/);
+});
+
+test("public and product print the checklist that check can't verify", () => {
+  const result = kit(initRepo("product"), "check");
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.out, /NOTE not verified by kit check: Protect the base branch/);
+  assert.match(result.out, /NOTE not verified by kit check: Scan the whole git history for secrets/);
+  assert.doesNotMatch(kit(initRepo("personal"), "check").out, /not verified by kit check/);
+});
+
+test("a sandbox may add kit-check, and then it is checked", () => {
+  const repo = initRepo("sandbox");
+  mkdirSync(join(repo, ".github/workflows"), { recursive: true });
+  const target = join(repo, ".github/workflows/kit-check.yml");
+  cpSync(join(KIT_ROOT, "modules/core/files/.github/workflows/kit-check.yml"), target);
+  assert.match(kit(repo, "check").out, /kit\.lock: wrong or missing hash for \.github\/workflows\/kit-check\.yml/);
+  git(repo, "checkout", "-q", "-b", "kit-sync");
+  assert.equal(kit(repo, "sync", "--write").status, 0);
+  assert.equal(kit(repo, "check").status, 0);
+  appendFileSync(target, "\n# local edit\n");
+  assert.match(kit(repo, "check").out, /kit-check\.yml: differs from kit/);
+});
+
+test("an unknown profile is could-not-verify", () => {
+  const repo = initRepo("sandbox");
+  setPolicy(repo, "profile", "enterprise");
+  const result = kit(repo, "check");
+  assert.equal(result.status, 2, result.out);
+  assert.match(result.out, /COULD NOT VERIFY .*unknown profile: "enterprise"/);
+});
+
+test("reassess shows what would change and edits nothing without --write", () => {
+  const repo = initRepo("sandbox", "--modules", "core");
+  const before = readFileSync(join(repo, ".agent/policy.yml"), "utf8");
+  const filesBefore = repoFiles(repo);
+  const dry = kit(repo, "init", "--reassess", ...answerFlags(ANSWERS.public));
+  assert.equal(dry.status, 0, dry.out);
+  assert.match(dry.out, /CHANGE profile sandbox -> public/);
+  assert.match(dry.out, /UPDATE project \.agent\/policy\.yml/);
+  assert.match(dry.out, /CREATE project ARCHITECTURE\.md/);
+  assert.match(dry.out, /CREATE managed \.github\/workflows\/kit-check\.yml/);
+  assert.match(dry.out, /missing section "## Start here"; left unchanged/);
+  assert.equal(readFileSync(join(repo, ".agent/policy.yml"), "utf8"), before);
+  assert.deepEqual(repoFiles(repo), filesBefore);
+
+  const agents = readFileSync(join(repo, "AGENTS.md"), "utf8");
+  assert.equal(kit(repo, "init", "--reassess", ...answerFlags(ANSWERS.public), "--write").status, 0);
+  const after = readFileSync(join(repo, ".agent/policy.yml"), "utf8");
+  assert.match(after, /^profile: public$/m);
+  assert.equal(after.replace(/^profile.*\n/gm, ""), before.replace(/^profile.*\n/gm, ""));
+  assert.equal(readFileSync(join(repo, "AGENTS.md"), "utf8"), agents);
+  assert.equal(existsSync(join(repo, "docs/operations/deploy.md")), true);
+  assert.equal(kit(repo, "check").status, 1, "AGENTS.md still needs the new sections");
+
+  const down = kit(repo, "init", "--reassess", ...answerFlags(ANSWERS.sandbox));
+  assert.match(down.out, /NOTE docs\/STATUS\.md: no longer required by sandbox; left in place/);
+  assert.equal(kit(tempDir(), "init", "--reassess", ...answerFlags(ANSWERS.sandbox)).status, 2);
+});
+
+test("a repo with no profile keeps the full requirements", () => {
+  const repo = adopted();
+  assert.doesNotMatch(readFileSync(join(repo, ".agent/policy.yml"), "utf8"), /^profile/m);
+  const agents = readFileSync(join(repo, "AGENTS.md"), "utf8");
+  assert.doesNotMatch(agents, /deploy\.md|PRIVACY\.md/);
+  for (const path of ["ARCHITECTURE.md", ".github/workflows/kit-check.yml", ".agent/freshness.mjs"]) {
+    const copy = adopted();
+    rmSync(join(copy, path));
+    assert.equal(kit(copy, "check").status, 1, path);
+  }
+  const noCi = adopted();
+  rmSync(join(noCi, ".github/workflows/ci.yml"));
+  assert.match(kit(noCi, "check").out, /no project workflow has the job "ci"/);
+  writeFileSync(join(repo, "docs/PRIVACY.md"), "x\n");
+  assert.match(kit(repo, "check").out, /docs\/PRIVACY\.md: not part of the standard layout/);
+});
+
+test("reassess can give a repo with no profile its first profile", () => {
+  const repo = adopted("core");
+  const result = kit(repo, "init", "--reassess", ...answerFlags(ANSWERS.product), "--write");
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.out, /CHANGE profile none \(full requirements\) -> product/);
+  assert.equal(existsSync(join(repo, "docs/SECURITY.md")), true);
+  const check = kit(repo, "check");
+  assert.equal(check.status, 0, check.out);
+});

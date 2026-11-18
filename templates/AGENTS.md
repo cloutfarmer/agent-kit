@@ -1,8 +1,7 @@
 # {{PROJECT}} agent guide
 
 This is the canonical entry point for coding agents. Keep it short. Durable
-design belongs in `ARCHITECTURE.md`; volatile state and exact procedures belong
-under `docs/`.
+design, current state and exact procedures belong in their own documents, not here.
 
 ## Repository
 
@@ -20,6 +19,8 @@ Read only the documents needed for the task:
 | Current readiness or open questions | `docs/STATUS.md` |
 | Tests or verification | `docs/TESTING.md` and `docs/STATUS.md` |
 | Agent limits for this repo | `.agent/policy.yml` and `.agent/lessons.md` |
+| Deploying | `docs/operations/deploy.md` |
+| Security, privacy or rollback | `docs/SECURITY.md`, `docs/PRIVACY.md` and `docs/operations/rollback.md` |
 
 `docs/README.md` is the complete index. Files in `docs/history/` are immutable
 evidence, not current instructions.
