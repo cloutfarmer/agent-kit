@@ -23,6 +23,28 @@
   this, and the setting stays required. The minimum Claude Code version is corrected to
   2.1.257, as in the current docs.
 
+## 1.7.0
+
+- Optional `profile` in `.agent/policy.yml`: `sandbox`, `personal`, `public` or `product`,
+  with an optional `profile_reason`. Each profile requires only the docs, `AGENTS.md`
+  sections, CI and managed files its purpose needs. Exposure sets the security floor and
+  stakes set the amount of process.
+- Every profile keeps `CLAUDE.md`, `AGENTS.md` with `Safety rules` and `Skill vetting`,
+  the policy, and the `guard` and `skill-gate` hooks. `sandbox` leaves out CI,
+  `kit-check`, the repository scan and the freshness hook. `personal` leaves out
+  `kit-check`. A left-out managed file is still checked if the repo has it.
+- New `kit init`: seven questions, a recommended profile with its reasons, and a preview
+  until `--write`. Works with flags and no terminal. A lighter profile than recommended
+  needs `--profile` and `--reason`. `kit init --reassess` shows what a new profile would
+  change and edits only the profile lines with `--write`.
+- New templates: `docs/operations/deploy.md` (`public`), and `docs/SECURITY.md`,
+  `docs/PRIVACY.md` and `docs/operations/rollback.md` (`product`). `public` and `product`
+  print a checklist of GitHub and machine settings that `check` can't verify.
+- A repo with no profile keeps every 1.6.0 requirement. An unknown profile is
+  "could not verify".
+- `adopt` and `sync` now print every required `AGENTS.md` section a file lacks, not only
+  `Skill vetting`. The `AGENTS.md` template intro no longer names `ARCHITECTURE.md`.
+
 ## 1.6.0
 
 - `agent-brief` now separates reading from writing. The `review` job has read-only GitHub
