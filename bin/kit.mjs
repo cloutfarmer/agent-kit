@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// agent-kit: adopt, check and sync a repository against this kit version.
+// agent-kit: adopt, check, sync and report the status of repositories against this kit version.
 // Exit codes: 0 pass, 1 fail, 2 could not verify.
 
 import { createHash } from "node:crypto";
@@ -73,6 +73,7 @@ const PROFILE_STEPS = {
     ci: true,
     optional: [],
     modules: ["core", "review", "triage"],
+    historyScan: true,
     checklist: [
       "Protect the base branch on GitHub: require a pull request before merging.",
       "Make the ci and kit-check jobs required status checks.",
@@ -86,6 +87,7 @@ const PROFILE_STEPS = {
     ci: true,
     optional: [],
     modules: ["core", "review", "triage"],
+    historyScan: true,
     checklist: [
       "Run agents in a sandbox (container, VM or cloud session) that has no production access.",
       "Keep production credentials separate: agents and CI test jobs get only dev or test keys.",
@@ -102,7 +104,7 @@ export function requirements(profile) {
   if (!profile) {
     return {
       docs: REQUIRED_DOCS, sections: AGENTS_SECTIONS, ci: true, optional: new Set(),
-      modules: ["core", "review", "triage"], checklist: [],
+      modules: ["core", "review", "triage"], checklist: [], historyScan: false,
     };
   }
   const steps = PROFILES.slice(0, PROFILES.indexOf(profile) + 1).map((name) => PROFILE_STEPS[name]);
@@ -114,6 +116,7 @@ export function requirements(profile) {
     optional: new Set(steps.at(-1).optional),
     modules: steps.at(-1).modules,
     checklist: steps.flatMap((step) => step.checklist),
+    historyScan: steps.some((step) => step.historyScan),
   };
 }
 
@@ -558,19 +561,59 @@ function ciStep(name, run) {
   return `      - name: ${name}\n        run: ${run}\n`;
 }
 
+// Actions in generated CI, pinned to full commit SHAs so a moved tag can't change what runs.
+const ACTIONS = {
+  checkout: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0",
+  setupNode: "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+  setupPython: "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0",
+};
+// The gitleaks command-line tool (MIT licensed, no license key), checked against the
+// SHA-256 published with the release. gitleaks-action needs a license key for organizations.
+const GITLEAKS_VERSION = "8.30.1";
+const GITLEAKS_SHA256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb";
+export const HISTORY_JOB = "secret-history";
+
+// A job that scans every commit for secrets. It reads the repo and needs no secrets itself.
+export function renderHistoryJob() {
+  return `  ${HISTORY_JOB}:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: ${ACTIONS.checkout}
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks ${GITLEAKS_VERSION}
+        env:
+          GITLEAKS_VERSION: "${GITLEAKS_VERSION}"
+          GITLEAKS_SHA256: ${GITLEAKS_SHA256}
+        run: |
+          archive="gitleaks_\${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v\${GITLEAKS_VERSION}/$archive"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "$url"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan Git history for secrets
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --verbose --no-color --no-banner --exit-code 1 .'
+`;
+}
+
 // Writes a starting CI file from what the repo actually contains. The project owns it afterward.
-export function renderCi(repo, job, scanCommand, baseBranch) {
+// public and product repos also get a job that scans the Git history for secrets.
+export function renderCi(repo, job, scanCommand, baseBranch, profile) {
   let steps = "";
   const packagePath = join(repo, "package.json");
   if (existsSync(packagePath)) {
     const scripts = JSON.parse(readFileSync(packagePath, "utf8")).scripts ?? {};
-    steps += "      - uses: actions/setup-node@v4\n        with:\n          node-version: \"22\"\n";
+    steps += `      - uses: ${ACTIONS.setupNode}\n        with:\n          node-version: "22"\n`;
     steps += ciStep("Install", existsSync(join(repo, "package-lock.json")) ? "npm ci" : "npm install");
     for (const script of ["typecheck", "lint", "test", "build"]) {
       if (scripts[script]) steps += ciStep(script, `npm run ${script}`);
     }
   } else if (existsSync(join(repo, "pyproject.toml")) || existsSync(join(repo, "requirements.txt"))) {
-    steps += "      - uses: actions/setup-python@v5\n        with:\n          python-version: \"3.12\"\n";
+    steps += `      - uses: ${ACTIONS.setupPython}\n        with:\n          python-version: "3.12"\n`;
     if (existsSync(join(repo, "requirements.txt"))) {
       steps += ciStep("Install", "python -m pip install -r requirements.txt");
     }
@@ -578,6 +621,7 @@ export function renderCi(repo, job, scanCommand, baseBranch) {
   }
   steps += ciStep("Diff check", "git diff --check");
   steps += ciStep("Repository scan", scanCommand);
+  const history = requirements(profile).historyScan ? `\n${renderHistoryJob()}` : "";
   return `name: ci
 
 # Owned by this project. Run only checks that are safe and need no production credentials.
@@ -595,8 +639,32 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-${steps}`;
+      - uses: ${ACTIONS.checkout}
+        with:
+          persist-credentials: false
+${steps}${history}`;
+}
+
+// The project's own workflows, excluding the kit's managed ones.
+function projectWorkflowTexts(repo, policy) {
+  return workflowFiles(repo, managedFiles(policy.modules)).map((path) => readFileSync(join(repo, path), "utf8"));
+}
+
+// True when the profile wants a history scan and no project workflow runs gitleaks.
+// The kit never edits project CI, so this is printed as a step to do by hand.
+function needsHistoryScan(repo, policy) {
+  if (!requirements(policy.profile).historyScan) return false;
+  return !projectWorkflowTexts(repo, policy).some((text) => /\bgitleaks\b/.test(text));
+}
+
+function historyNote() {
+  return `Add this job under "jobs:" in a project workflow, such as .github/workflows/ci.yml:\n${renderHistoryJob().trimEnd()}`;
+}
+
+function printHistoryNote(repo, policy) {
+  if (!needsHistoryScan(repo, policy)) return;
+  console.log(`NOTE .github/workflows: profile ${policy.profile} needs a Git history secret scan; left unchanged.`);
+  console.log(historyNote());
 }
 
 function renderPolicy({ modules, baseBranch, ciJob, scanCommand }) {
@@ -673,12 +741,13 @@ function adopt(repo, options, policyText = null) {
     if (existsSync(join(repo, ciPath))) {
       console.log(`NOTE ${ciPath} exists without job "${policy.ci_job}"; left unchanged`);
     } else {
-      projectFiles.set(ciPath, renderCi(repo, policy.ci_job, policy.scan_command, policy.base_branch));
+      projectFiles.set(ciPath, renderCi(repo, policy.ci_job, policy.scan_command, policy.base_branch, policy.profile));
     }
   }
   if (!projectFiles.has(SETTINGS_PATH)) printSettingsNotes(settingsProblems(repo, requiredHooks(managed)), managed);
   if (!projectFiles.has("AGENTS.md")) printSectionNotes(repo, needs);
   if (delegate) printDelegateNotes(delegateProblems(repo).filter((problem) => !projectFiles.has(problem.path)));
+  if (!projectFiles.has(".github/workflows/ci.yml")) printHistoryNote(repo, policy);
 
   for (const path of creates) console.log(`CREATE managed ${path}`);
   for (const path of projectFiles.keys()) {
@@ -849,10 +918,8 @@ async function init(repo, options) {
   return adopt(repo, options, policyText);
 }
 
-function sync(repo, options) {
-  const policy = readPolicy(repo);
-  const lock = readLock(repo);
-  const needs = requirements(policy.profile);
+// The managed files sync would write or delete. Reads only.
+function syncPlan(repo, policy, lock) {
   const managed = expectedManaged(repo, policy);
   const updates = [];
   for (const [path, source] of managed) {
@@ -860,11 +927,20 @@ function sync(repo, options) {
   }
   const removals = Object.keys(lock.files)
     .filter((path) => !managed.has(path) && existsSync(join(repo, path)));
+  return { managed, updates, removals };
+}
+
+function sync(repo, options) {
+  const policy = readPolicy(repo);
+  const lock = readLock(repo);
+  const needs = requirements(policy.profile);
+  const { managed, updates, removals } = syncPlan(repo, policy, lock);
   for (const path of updates) console.log(`UPDATE ${path}`);
   for (const path of removals) console.log(`REMOVE ${path}`);
   printSettingsNotes(settingsProblems(repo, requiredHooks(managed)), managed);
   printSectionNotes(repo, needs);
   if (policy.modules.includes("delegate")) printDelegateNotes(delegateProblems(repo));
+  printHistoryNote(repo, policy);
   console.log(`Kit ${lock.version} -> ${VERSION}`);
 
   if (!options.write) {
@@ -897,10 +973,150 @@ function check(repo, options) {
   return 0;
 }
 
+function compareVersions(a, b) {
+  const [x, y] = [a, b].map((version) => version.split(".").map(Number));
+  for (let i = 0; i < 3; i += 1) {
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+// Steps a person must do by hand, because sync never edits project-owned files.
+// Measured against this kit version, so a repo behind it sees what it needs after sync.
+function manualSteps(repo, policy, lock) {
+  const steps = [];
+  if (lock && !/^\d+\.\d+\.\d+$/.test(lock.version)) {
+    steps.push(`${LOCK_PATH} has an invalid version; run kit adopt to rebuild it`);
+  } else if (lock && compareVersions(lock.version, VERSION) < 0) {
+    const { updates, removals } = syncPlan(repo, policy, lock);
+    const changes = [...updates.map((path) => `update ${path}`), ...removals.map((path) => `remove ${path}`)];
+    steps.push(`Run kit sync on a review branch to move from ${lock.version} to ${VERSION}`
+      + (changes.length ? ` (${changes.join(", ")})` : " (no managed file changes)"));
+  } else if (lock && compareVersions(lock.version, VERSION) > 0) {
+    steps.push(`This kit checkout (${VERSION}) is older than the repo (${lock.version}); update the kit and rerun`);
+  }
+  const needs = requirements(policy.profile);
+  const managed = expectedManaged(repo, policy);
+  steps.push(...settingsProblems(repo, requiredHooks(managed)));
+  const agentsPath = join(repo, "AGENTS.md");
+  if (existsSync(agentsPath)) {
+    const agents = readFileSync(agentsPath, "utf8");
+    for (const section of needs.sections.filter((name) => !hasSection(agents, name))) {
+      steps.push(`AGENTS.md: add section "## ${section}"`);
+    }
+  }
+  if (policy.modules.includes("delegate")) steps.push(...delegateProblems(repo).map((problem) => problem.text));
+  if (needsHistoryScan(repo, policy)) {
+    steps.push(`.github/workflows: add the ${HISTORY_JOB} job (Git history secret scan); see the job below`);
+  }
+  return steps;
+}
+
+// Reads one repo and reports where it stands. Never writes files, runs git, uses the
+// network or runs the repo's code. Any error becomes "could not verify" for this repo only.
+export function repoStatus(repo) {
+  const status = {
+    result: "PASS", version: null, profile: null, modules: null,
+    problems: [], steps: [], warnings: [], unverified: [], historyScan: false,
+  };
+  const unknown = (error) => {
+    status.result = "COULD NOT VERIFY";
+    status.problems.push(error instanceof CouldNotVerify ? error.message : `${error.code ?? error.name}: ${error.message}`);
+  };
+  let policy;
+  let lock = null;
+  try {
+    if (!existsSync(repo) || !statSync(repo).isDirectory()) throw new CouldNotVerify("folder not found");
+    policy = readPolicy(repo);
+    status.profile = policy.profile ?? "none (full requirements)";
+    status.modules = policy.modules;
+    lock = readLock(repo);
+    status.version = lock.version;
+  } catch (error) {
+    unknown(error);
+  }
+  if (policy) {
+    try {
+      status.steps = manualSteps(repo, policy, lock);
+      status.historyScan = needsHistoryScan(repo, policy);
+    } catch (error) {
+      unknown(error);
+    }
+  }
+  if (status.result === "PASS") {
+    try {
+      const { failures, warnings, unverified } = runCheck(repo);
+      status.warnings = warnings;
+      status.unverified = unverified;
+      if (failures.length) {
+        status.result = "FAIL";
+        status.problems = failures;
+      }
+    } catch (error) {
+      unknown(error);
+    }
+  }
+  return status;
+}
+
+// Lists the direct child folders of root that have a kit policy.
+function reposUnder(root) {
+  if (!existsSync(root) || !statSync(root).isDirectory()) throw new CouldNotVerify(`--root ${root} is not a folder`);
+  return readdirSync(root)
+    .map((name) => join(root, name))
+    .filter((path) => {
+      try {
+        return statSync(path).isDirectory() && existsSync(join(path, POLICY_PATH));
+      } catch {
+        return false;
+      }
+    })
+    .sort();
+}
+
+function status(_repo, options) {
+  const repos = [];
+  if (options.repos) repos.push(...options.repos.split(",").map((path) => path.trim()).filter(Boolean));
+  if (options.root) repos.push(...reposUnder(options.root));
+  if (!options.repos && !options.root) throw new CouldNotVerify("status needs --repos PATH[,PATH...] or --root DIR");
+  if (!repos.length) {
+    throw new CouldNotVerify(options.root ? `no folder under ${options.root} has ${POLICY_PATH}` : "--repos lists no paths");
+  }
+
+  console.log(`Kit status for ${repos.length} repo${repos.length === 1 ? "" : "s"}. Latest available kit: ${VERSION} (this kit checkout).`);
+  const results = [];
+  const needScan = [];
+  for (const path of repos) {
+    const repoState = repoStatus(resolve(path));
+    results.push(repoState.result);
+    if (repoState.historyScan) needScan.push(path);
+    const version = repoState.version
+      ? `${repoState.version}${repoState.version === VERSION ? " (latest)" : ` (latest ${VERSION})`}`
+      : "unknown";
+    console.log(`\n${repoState.result}  ${path}`);
+    console.log(`  kit ${version} | profile ${repoState.profile ?? "unknown"} | modules ${repoState.modules?.join(", ") ?? "unknown"}`);
+    const label = repoState.result === "FAIL" ? "FAIL" : "WHY";
+    for (const problem of repoState.problems) console.log(`  ${label} ${problem}`);
+    for (const step of repoState.steps) console.log(`  TODO ${step}`);
+    const placeholders = repoState.warnings.filter((warning) => warning.endsWith("still has TODO(adopt) placeholders"));
+    if (placeholders.length) {
+      console.log(`  WARN TODO(adopt) placeholders still in: ${placeholders.map((warning) => warning.split(":")[0]).join(", ")}`);
+    }
+    for (const warning of repoState.warnings.filter((item) => !placeholders.includes(item))) console.log(`  WARN ${warning}`);
+    for (const item of repoState.unverified) console.log(`  NOT CHECKED ${item}`);
+  }
+  if (needScan.length) console.log(`\nFor ${needScan.join(", ")}: ${historyNote()}`);
+
+  const count = (name) => results.filter((result) => result === name).length;
+  console.log(`\nSummary: ${count("PASS")} pass, ${count("FAIL")} fail, ${count("COULD NOT VERIFY")} could not verify.`);
+  if (count("COULD NOT VERIFY")) return 2;
+  return count("FAIL") ? 1 : 0;
+}
+
 function parseArgs(argv) {
   const flags = new Set(["write", "replace-managed", "reassess"]);
   const values = new Set([
-    "repo", "modules", "ci-job", "scan-command", "base-branch", "latest-version", "profile", "reason",
+    "repo", "repos", "root", "modules", "ci-job", "scan-command", "base-branch", "latest-version", "profile", "reason",
     ...QUESTIONS.map(({ key }) => key),
   ]);
   const options = {};
@@ -916,9 +1132,10 @@ function parseArgs(argv) {
 
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
-  const commands = { adopt, check, init, sync };
+  const commands = { adopt, check, init, status, sync };
   if (!commands[command]) {
-    console.log("Usage: kit.mjs <init|adopt|check|sync> [--repo PATH] [--write] [options]");
+    console.log("Usage: kit.mjs <init|adopt|check|sync> [--repo PATH] [--write] [options]\n"
+      + "       kit.mjs status --repos PATH[,PATH...] | --root DIR");
     return 2;
   }
   let options;

@@ -1194,3 +1194,268 @@ test("every profile works with delegate, the verifier and setup_command", () => 
     assert.match(readFileSync(join(repo, ".agent/policy.yml"), "utf8"), new RegExp(`^profile: ${profile}$`, "m"));
   }
 });
+
+// ---- 1.10.0: stronger secret scanning ----
+
+// Fake tokens are assembled at runtime so this file never holds a token-shaped string.
+const RANDOM = "aB3dE5gH7jK9mN1pQ2rS4tU6vW8xY0zA".repeat(8);
+const rand = (length) => RANDOM.slice(0, length);
+const FAKE_TOKENS = {
+  "OpenAI API key": ["sk", "proj", `${rand(64)}${"T3Blbk"}FJ${rand(64)}`].join("-"),
+  "Stripe live key": ["sk", "live", rand(24)].join("_"),
+  "Google API key": ["AI", "za", rand(35)].join(""),
+  "Slack bot token": ["xoxb", "1234567890", "1234567890123", rand(24)].join("-"),
+  "Slack user token": ["xoxp", "1234567890", "1234567890", "1234567890", rand(32)].join("-"),
+  "Slack app token": ["xapp", "1", "A01B2C3D4E5", "1234567890123", rand(64)].join("-"),
+  "Slack webhook URL": `${["https://hooks.slack", "com/services/T01ABCDEF2G/B01ABCDEF2G/"].join(".")}${rand(24)}`,
+  "npm token": ["npm", rand(36)].join("_"),
+};
+
+test("the scan finds common OpenAI, Stripe, Google, Slack and npm tokens without printing them", () => {
+  const legacyOpenAi = ["sk", `${rand(20)}T3Blbk${"FJ"}${rand(20)}`].join("-");
+  const restricted = ["rk", "live", rand(30)].join("_");
+  for (const [rule, token] of [...Object.entries(FAKE_TOKENS), ["OpenAI API key", legacyOpenAi], ["Stripe live key", restricted]]) {
+    const result = scanRepo({ "config.js": `// setup\nconst token = "${token}";\n` });
+    assert.equal(result.status, 1, `${rule}: ${result.out}`);
+    assert.match(result.out, new RegExp(`secret-like content found: config\\.js:2 \\(${rule}\\)`));
+    assert.equal(result.out.includes(token), false, `${rule} value was printed`);
+    assert.equal(result.out.includes(token.slice(-12)), false, `${rule} value was partly printed`);
+  }
+});
+
+test("the scan ignores placeholders, test keys and public identifiers", () => {
+  const lines = [
+    ["pk", "live", rand(24)].join("_"), // Stripe publishable keys are public by design.
+    ["sk", "test", "4eC39HqLyjWDarjtT1zdp7dc"].join("_"), // Stripe's documented test key.
+    ["sk", "live", "X".repeat(24)].join("_"),
+    `${["https://hooks.slack", "com/services/T00000000/B00000000/"].join(".")}${"X".repeat(24)}`,
+    ["AI", "zaSy", "X".repeat(33)].join(""),
+    "xoxb-your-token-here",
+    ["npm", "0".repeat(36)].join("_"),
+    "process.env.npm_config_user_agent",
+    ["sk", "proj", rand(60)].join("-"), // No OpenAI marker in the middle.
+    ["AKIA", "IOSFODNN7EXAMPLE"].join(""), // AWS's documented example key.
+    "const grid = 'task-list sk-12';",
+  ];
+  const result = scanRepo({ "README.md": `${lines.join("\n")}\n` });
+  assert.equal(result.status, 0, result.out);
+});
+
+test("a kit-scan: allow line is skipped and listed, and other lines still fail", () => {
+  const google = FAKE_TOKENS["Google API key"];
+  const allowed = scanRepo({ "firebase.js": `apiKey: "${google}", // kit-scan: allow public web key\n` });
+  assert.equal(allowed.status, 0, allowed.out);
+  assert.match(allowed.out, /NOTE secret-like line allowed by "kit-scan: allow": firebase\.js:1/);
+  const mixed = scanRepo({ "firebase.js": `a = "${google}"; // kit-scan: allow\nb = "${FAKE_TOKENS["npm token"]}";\n` });
+  assert.equal(mixed.status, 1, mixed.out);
+  assert.match(mixed.out, /firebase\.js:2 \(npm token\)/);
+  assert.doesNotMatch(mixed.out, /firebase\.js:1 \(/);
+});
+
+// ---- 1.10.0: generated CI ----
+
+const { renderCi, HISTORY_JOB } = await import(KIT);
+const ACTIONLINT = process.env.ACTIONLINT
+  ?? (spawnSync("actionlint", ["--version"]).status === 0 ? "actionlint" : null);
+
+test("generated CI pins every action, and only public and product scan the Git history", () => {
+  const stacks = { none: {}, node: { "package.json": JSON.stringify({ scripts: { test: "x" } }) }, python: { "requirements.txt": "" } };
+  for (const [stack, files] of Object.entries(stacks)) {
+    const repo = tempDir();
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(repo, name), text);
+    for (const profile of [undefined, ...PROFILES]) {
+      const ci = renderCi(repo, "ci", "node .agent/repository-scan.mjs", "main", profile);
+      const label = `${stack}/${profile ?? "no profile"}`;
+      const uses = [...ci.matchAll(/uses: (.+)$/gm)].map(([, value]) => value);
+      assert.ok(uses.length, label);
+      for (const value of uses) assert.match(value, /^[\w-]+\/[\w-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$/, `${label}: ${value}`);
+      const scans = profile === "public" || profile === "product";
+      assert.equal(ci.includes(`  ${HISTORY_JOB}:`), scans, label);
+      assert.doesNotMatch(ci, /: write/, label);
+      assert.doesNotMatch(ci, /secrets\./, label);
+      if (scans) {
+        assert.match(ci, /fetch-depth: 0/);
+        assert.match(ci, /sha256sum --check --strict/);
+        assert.match(ci, /GITLEAKS_SHA256: [0-9a-f]{64}\n/);
+        assert.match(ci, /gitleaks" git --redact/);
+        assert.doesNotMatch(ci, /gitleaks-action|GITLEAKS_LICENSE/);
+      }
+      if (ACTIONLINT) {
+        const path = join(repo, `ci-${profile ?? "none"}.yml`);
+        writeFileSync(path, ci);
+        const lint = spawnSync(ACTIONLINT, [path], { encoding: "utf8" });
+        assert.equal(lint.status, 0, `${label}: ${lint.stdout}${lint.stderr}`);
+      }
+    }
+  }
+});
+
+test("adopt writes the history scan into new public CI, and never edits existing CI", () => {
+  const product = initRepo("product", "--modules", "core");
+  assert.match(readFileSync(join(product, ".github/workflows/ci.yml"), "utf8"), /secret-history:/);
+  const personal = initRepo("personal", "--modules", "core");
+  assert.doesNotMatch(readFileSync(join(personal, ".github/workflows/ci.yml"), "utf8"), /gitleaks/);
+
+  // A personal repo moving to public keeps its CI, and is told what to add.
+  const ciPath = join(personal, ".github/workflows/ci.yml");
+  const before = readFileSync(ciPath, "utf8");
+  const result = kit(personal, "init", "--reassess", ...answerFlags(ANSWERS.public), "--write");
+  assert.equal(result.status, 0, result.out);
+  assert.match(result.out, /NOTE \.github\/workflows: profile public needs a Git history secret scan; left unchanged/);
+  assert.match(result.out, /Add this job under "jobs:"[\s\S]*secret-history:[\s\S]*sha256sum --check/);
+  assert.equal(readFileSync(ciPath, "utf8"), before);
+});
+
+test("sync prints the history scan job for a public repo without one, and edits no CI", () => {
+  const repo = initRepo("public", "--modules", "core");
+  const ciPath = join(repo, ".github/workflows/ci.yml");
+  writeFileSync(ciPath, readFileSync(ciPath, "utf8").replace(/\n  secret-history:[\s\S]*$/, "\n"));
+  const before = readFileSync(ciPath, "utf8");
+  git(repo, "checkout", "-q", "-b", "kit-sync");
+  const synced = kit(repo, "sync", "--write");
+  assert.equal(synced.status, 0, synced.out);
+  assert.match(synced.out, /needs a Git history secret scan[\s\S]*secret-history:/);
+  assert.equal(readFileSync(ciPath, "utf8"), before);
+  assert.equal(kit(repo, "check").status, 0, "a missing history scan is printed, not failed");
+  assert.doesNotMatch(kit(initRepo("public", "--modules", "core"), "sync").out, /history secret scan/);
+});
+
+// ---- 1.10.0: kit status ----
+
+function status(...args) {
+  const result = spawnSync("node", [KIT, "status", ...args], { encoding: "utf8" });
+  return { status: result.status, out: result.stdout + result.stderr };
+}
+
+// Every file path and its content, to prove status writes nothing.
+function snapshot(dir) {
+  const listing = spawnSync("find", [dir, "-type", "f", "-not", "-path", "*/.git/*"], { encoding: "utf8" });
+  return listing.stdout.split("\n").filter(Boolean).sort()
+    .map((path) => { try { return `${path}\n${readFileSync(path, "utf8")}`; } catch { return `${path}\nunreadable`; } });
+}
+
+function setLockVersion(repo, version) {
+  const path = join(repo, ".agent/kit.lock");
+  const lock = readJson(path);
+  lock.version = version;
+  writeFileSync(path, JSON.stringify(lock));
+}
+
+test("status reports a passing repo with its version, profile and modules", () => {
+  const repo = initRepo("personal");
+  const result = status("--repos", repo);
+  assert.equal(result.status, 0, result.out);
+  const version = readFileSync(join(KIT_ROOT, "VERSION"), "utf8").trim();
+  assert.match(result.out, new RegExp(`Latest available kit: ${version.replaceAll(".", "\\.")}`));
+  assert.match(result.out, new RegExp(`PASS  ${repo}\\n  kit ${version.replaceAll(".", "\\.")} \\(latest\\) \\| profile personal \\| modules core, review`));
+  assert.doesNotMatch(result.out, /  TODO /);
+  assert.match(result.out, /  WARN TODO\(adopt\) placeholders still in: AGENTS\.md, README\.md/);
+  assert.match(result.out, /Summary: 1 pass, 0 fail, 0 could not verify/);
+});
+
+test("status lists failures and the manual steps still needed", () => {
+  const repo = initRepo("public", "--modules", "core");
+  rmSync(join(repo, "docs/operations/deploy.md"));
+  const agents = join(repo, "AGENTS.md");
+  writeFileSync(agents, readFileSync(agents, "utf8").replace("## Skill vetting", "## Skills"));
+  const settings = readJson(join(repo, ".claude/settings.json"));
+  delete settings.hooks.PreToolUse;
+  writeFileSync(join(repo, ".claude/settings.json"), JSON.stringify(settings));
+  const ciPath = join(repo, ".github/workflows/ci.yml");
+  writeFileSync(ciPath, readFileSync(ciPath, "utf8").replace(/\n  secret-history:[\s\S]*$/, "\n"));
+
+  const result = status("--repos", repo);
+  assert.equal(result.status, 1, result.out);
+  assert.match(result.out, /FAIL  .*\n  kit .* \| profile public \| modules core/);
+  assert.match(result.out, /  FAIL docs\/operations\/deploy\.md: required file is missing/);
+  assert.match(result.out, /  TODO \.claude\/settings\.json: no PreToolUse hook runs \.agent\/guard\.mjs/);
+  assert.match(result.out, /  TODO AGENTS\.md: add section "## Skill vetting"/);
+  assert.match(result.out, /  TODO \.github\/workflows: add the secret-history job/);
+  assert.match(result.out, /  NOT CHECKED Protect the base branch/);
+  assert.match(result.out, /Add this job under "jobs:"[\s\S]*sha256sum --check/);
+});
+
+test("status calls an unreadable or broken repo could-not-verify", () => {
+  const broken = initRepo("sandbox");
+  writeFileSync(join(broken, ".agent/kit.lock"), "{not json");
+  const result = status("--repos", broken);
+  assert.equal(result.status, 2, result.out);
+  assert.match(result.out, /COULD NOT VERIFY  .*\n  kit unknown \| profile sandbox/);
+  assert.match(result.out, /  WHY \.agent\/kit\.lock can't be parsed/);
+  assert.equal(status("--repos", join(tempDir(), "missing")).status, 2);
+
+  if (process.getuid?.() !== 0) {
+    const locked = initRepo("sandbox");
+    const policy = join(locked, ".agent/policy.yml");
+    spawnSync("chmod", ["000", policy]);
+    const unreadable = status("--repos", locked);
+    spawnSync("chmod", ["644", policy]);
+    assert.equal(unreadable.status, 2, unreadable.out);
+    assert.match(unreadable.out, /WHY EACCES/);
+  }
+});
+
+test("status of a repo on an older kit is could-not-verify, with the sync step", () => {
+  const repo = initRepo("personal");
+  setLockVersion(repo, "1.8.0");
+  const result = status("--repos", repo);
+  assert.equal(result.status, 2, result.out);
+  assert.match(result.out, /kit 1\.8\.0 \(latest \d+\.\d+\.\d+\)/);
+  assert.match(result.out, /WHY \.agent\/kit\.lock is on 1\.8\.0, but this tool is/);
+  assert.match(result.out, /TODO Run kit sync on a review branch to move from 1\.8\.0 to \S+ \(no managed file changes\)/);
+  appendFileSync(join(repo, SKILL), "\nold text\n");
+  assert.match(status("--repos", repo).out, /move from 1\.8\.0 to \S+ \(update \.claude\/skills\/ponytail-review\/SKILL\.md\)/);
+  setLockVersion(repo, "99.0.0");
+  assert.match(status("--repos", repo).out, /TODO This kit checkout .* is older than the repo \(99\.0\.0\)/);
+});
+
+test("status of mixed repos reports each one, and the worst result sets the exit code", () => {
+  const root = tempDir();
+  const make = (name, profile) => {
+    const repo = join(root, name);
+    mkdirSync(repo);
+    git(repo, "init", "-q", "-b", "main");
+    assert.equal(kit(repo, "init", ...answerFlags(ANSWERS[profile]), "--write").status, 0);
+    return repo;
+  };
+  const good = make("a-good", "sandbox");
+  const failing = make("b-failing", "personal");
+  rmSync(join(failing, "docs/STATUS.md"));
+  mkdirSync(join(root, "c-not-adopted"));
+  writeFileSync(join(root, "d-file.txt"), "x\n");
+
+  const pairResult = status("--repos", `${good},${failing}`);
+  assert.equal(pairResult.status, 1, pairResult.out);
+  assert.match(pairResult.out, /Summary: 1 pass, 1 fail, 0 could not verify/);
+
+  const broken = make("e-broken", "public");
+  writeFileSync(join(broken, ".agent/policy.yml"), "modules: [core\n");
+  const before = snapshot(root);
+  const result = status("--root", root);
+  assert.equal(result.status, 2, result.out);
+  assert.match(result.out, /Kit status for 3 repos/);
+  assert.match(result.out, /PASS  .*a-good/);
+  assert.match(result.out, /FAIL  .*b-failing/);
+  assert.match(result.out, /COULD NOT VERIFY  .*e-broken/);
+  assert.doesNotMatch(result.out, /c-not-adopted|d-file/);
+  assert.ok(result.out.indexOf("b-failing") < result.out.indexOf("e-broken"), "status continued after a failure");
+  assert.match(result.out, /Summary: 1 pass, 1 fail, 1 could not verify/);
+  assert.deepEqual(snapshot(root), before, "status wrote to a repo");
+});
+
+test("status runs without git on the PATH, so it never needs git or project code", () => {
+  const repo = initRepo("product");
+  const result = spawnSync(process.execPath, [KIT, "status", "--repos", repo], {
+    encoding: "utf8", env: { PATH: "/nonexistent" },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /PASS  /);
+});
+
+test("status without repos, or with an empty root, is could-not-verify", () => {
+  assert.equal(status().status, 2);
+  const empty = status("--root", tempDir());
+  assert.equal(empty.status, 2, empty.out);
+  assert.match(empty.out, /COULD NOT VERIFY no folder under .* has \.agent\/policy\.yml/);
+  assert.equal(status("--root", join(tempDir(), "missing")).status, 2);
+});
