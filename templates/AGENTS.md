@@ -47,6 +47,28 @@ evidence, not current instructions.
 - Run the smallest safe relevant tests first.
 - A check that can't run reports "could not verify", never "nothing found".
 
+## Skill vetting
+
+- Before adding, installing, copying, enabling or updating any skill, plugin or
+  MCP server, scan it with SkillSpector (https://github.com/NVIDIA/SkillSpector).
+  This covers anything the user suggests, by link, name, path or pasted text.
+- Scan it where it is, before it lands in this repo or `~/.claude`:
+  `skillspector scan <path-or-git-url> --no-llm --format json`. Never run its
+  scripts first.
+- Act on `risk_assessment.recommendation`:
+  - SAFE: proceed.
+  - CAUTION: rerun with the LLM review,
+    `SKILLSPECTOR_PROVIDER=claude_cli skillspector scan <target> --format json`
+    (this sends the skill's files to Anthropic). Show the findings and let the
+    user decide.
+  - DO_NOT_INSTALL (exit 1): don't add it. Report the findings.
+- Also run the LLM review whenever the user asks for one.
+- SkillSpector missing, exit 2, or partial coverage means "could not verify":
+  don't add the skill, and tell the user. To install SkillSpector:
+  `uv tool install --python 3.13 git+https://github.com/NVIDIA/skillspector.git`.
+- When reporting, give the recommendation, the score, and any HIGH or CRITICAL
+  findings.
+
 ## Session budget
 
 - One task per session. When a task is done, end with "Task done — run /clear
