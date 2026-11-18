@@ -13,6 +13,8 @@ node bin/kit.mjs init  --repo ../my-project
 node bin/kit.mjs adopt --repo ../my-project --modules core,review,triage
 node bin/kit.mjs check --repo ../my-project
 node bin/kit.mjs sync  --repo ../my-project
+node bin/kit.mjs status --repos ../one,../two
+node bin/kit.mjs status --root ..
 ```
 
 | Exit code | Meaning |
@@ -20,6 +22,33 @@ node bin/kit.mjs sync  --repo ../my-project
 | 0 | Pass |
 | 1 | Fail: the repo differs from the kit |
 | 2 | Could not verify: the check itself couldn't finish |
+
+## `kit status`
+
+`status` shows where each repo stands before you migrate or sync it. It only reads: it
+never writes files, never runs `git` or other network commands, and never runs the
+repo's code.
+
+- `--repos PATH[,PATH...]` checks the listed folders.
+- `--root DIR` checks every direct child folder of `DIR` that has `.agent/policy.yml`.
+
+For each repo it prints the result of the same checks `kit check` runs (PASS, FAIL or
+COULD NOT VERIFY), the repo's kit version, the latest kit (the version of the kit
+checkout you run it from, so pull the kit first), the profile and the modules. Then it
+lists:
+
+- `FAIL` or `WHY` lines: what failed, or why the check couldn't finish.
+- `TODO` lines: steps to do by hand, because `sync` never edits project-owned files.
+  These include missing hooks in `.claude/settings.json`, missing `AGENTS.md` sections,
+  the `delegate` settings, the history scan job, and, for a repo on an older kit, the
+  managed files `sync` would update or remove.
+- `WARN` and `NOT CHECKED` lines: placeholders left to fill in, and the profile's
+  checklist that no tool can verify.
+
+A repo on an older kit is COULD NOT VERIFY, because this kit can only check against its
+own version. Its `TODO` lines still show what it needs after `sync`. One broken repo
+doesn't stop the others. The exit code is 2 if any repo could not be verified, otherwise
+1 if any failed, otherwise 0. No repos found is 2.
 
 Without a profile, `adopt` installs `core`, `review` and `triage`. With one, it defaults to
 `core` for `sandbox`, `core,review` for `personal`, and all three for `public` and
@@ -41,6 +70,9 @@ above it.
 | `personal` | Something deployed, or real personal data, paid services or production credentials | `docs/STATUS.md`, `docs/TESTING.md`, `docs/README.md`, CI with tests and the secret scan, the freshness hook |
 | `public` | A public repo or a live public site | `ARCHITECTURE.md`, `docs/operations/deploy.md`, `kit-check`, and a branch protection checklist |
 | `product` | Other people's data, accounts or money | `docs/SECURITY.md`, `docs/PRIVACY.md`, `docs/operations/rollback.md`, and a checklist for sandboxing, separate production credentials, dependency checks and a secret-history scan |
+
+`public` and `product` repos also get a Git history secret scan in CI. See
+[Secret scanning](#secret-scanning).
 
 Every profile keeps `CLAUDE.md`, `AGENTS.md` with its `Safety rules` and `Skill vetting`
 sections, `.agent/policy.yml`, and the `guard` and `skill-gate` hooks. A managed file a
@@ -155,6 +187,40 @@ branches. Claude Code tells the hook which agent is calling through `agent_type`
 It is a guardrail, not a sandbox. A script or interpreter started from Bash can still do
 things the hook can't see. To change a protected file through an agent, start that session
 with `KIT_GUARD=off claude`.
+
+## Secret scanning
+
+The managed `.agent/repository-scan.mjs` runs in each repo's CI. It fails on tracked
+`.env` files, files over 5 MiB, and lines that look like a secret: private keys, AWS,
+GitHub, Anthropic, OpenAI, Stripe live, Google API, Slack and npm tokens, Resend and Neon
+keys, and database URLs with a password. It prints the file, line and kind of secret,
+never the value.
+
+Each pattern matches one provider's token format, so ordinary text doesn't trip it.
+Placeholders such as `sk_live_XXXX`, Stripe test keys, publishable `pk_` keys and AWS's
+documented example key are not reported. If a line holds a value that is meant to be
+public, such as a Firebase web API key, add `kit-scan: allow` to that line. The scan
+skips it and prints a `NOTE` naming the file and line, so the exception shows up in
+review.
+
+The repository scan only reads the current files. A secret that was committed and then
+deleted is still in the Git history. So `public` and `product` CI made by `adopt` or
+`init` adds a `secret-history` job:
+
+- It runs the [gitleaks](https://github.com/gitleaks/gitleaks) command-line tool on every
+  commit, with `--redact` so the log shows where a secret is but not the secret.
+- It downloads an exact gitleaks version and checks the file's SHA-256 hash before
+  running it. It uses the MIT-licensed command-line tool, not `gitleaks-action`, because
+  that action needs a license key for repos owned by an organization.
+- It has read-only permissions and uses no secrets.
+
+The kit never edits a project's existing CI. For a `public` or `product` repo whose
+workflows don't run gitleaks, `adopt`, `sync` and `status` print the job to paste in.
+`check` doesn't fail without it. If the scan finds a secret, rotate it (replace it at the
+provider) first; removing it from history doesn't make it safe again.
+
+Actions in generated CI are pinned to full commit SHAs with a version comment, as the
+managed workflows already are.
 
 ## Skill vetting (core)
 

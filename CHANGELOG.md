@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.10.0
+
+- New `kit status --repos PATH[,PATH...]` and `kit status --root DIR`. For each repo it
+  shows the kit version, the latest kit, the profile, the modules, the `check` result,
+  and the steps still needed by hand. It never writes files, runs `git`, uses the network
+  or runs project code. One broken repo doesn't stop the others. Exit 0 if all pass,
+  1 if any fail, 2 if any could not be verified.
+- `.agent/repository-scan.mjs` finds OpenAI, Stripe live, Google API, Slack and npm
+  tokens. It now names the line and kind of secret, still never the value. Placeholders
+  with too little variety, such as `sk_live_XXXX` or `npg_xxxxxxxx`, and AWS's
+  `...EXAMPLE` key are no longer reported. A line with `kit-scan: allow` is skipped and
+  listed. Run `sync` to get the new scan.
+- CI generated for `public` and `product` repos adds a `secret-history` job that runs
+  gitleaks 8.30.1 over the whole Git history. It checks the download's SHA-256, has
+  read-only permissions and needs no secrets or license key. Existing CI is never edited:
+  `adopt`, `sync` and `status` print the job to add, and `check` doesn't require it.
+- Generated CI pins `actions/checkout`, `actions/setup-node` and `actions/setup-python`
+  to full commit SHAs with version comments, and checks out without saved credentials.
+
 ## 1.9.0
 
 - Optional `review_trigger` in `.agent/policy.yml`: `manual`, `label` or `ready`. It
